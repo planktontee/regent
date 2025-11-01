@@ -1,0 +1,12 @@
+.{
+    .name = .regent,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "regent",
+        "regent.zig",
+    },
+    .fingerprint = 0xe201c029c35b07ce,
+}
