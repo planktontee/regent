@@ -21,14 +21,7 @@ pub fn FieldEnum(comptime T: type) type {
     const field_infos = std.meta.fields(T);
 
     if (field_infos.len == 0) {
-        return @Type(.{
-            .@"enum" = .{
-                .tag_type = u0,
-                .fields = &.{},
-                .decls = &.{},
-                .is_exhaustive = true,
-            },
-        });
+        return @Enum(u0, .exhaustive, &.{}, &.{});
     }
 
     if (@typeInfo(T) == .@"union") {
@@ -42,20 +35,46 @@ pub fn FieldEnum(comptime T: type) type {
         }
     }
 
-    var enumFields: [field_infos.len]std.builtin.Type.EnumField = undefined;
-    var decls = [_]std.builtin.Type.Declaration{};
-    inline for (field_infos, 0..) |field, i| {
-        enumFields[i] = .{
-            .name = field.name ++ "",
-            .value = i,
-        };
+    var enumNames: [field_infos.len][]const u8 = undefined;
+    for (field_infos, &enumNames) |field, *name| name.* = field.name;
+    const IntTag = std.math.IntFittingRange(0, field_infos.len);
+    return @Enum(IntTag, .exhaustive, &enumNames, &std.simd.iota(IntTag, enumNames.len));
+}
+
+pub fn Array(arr: std.builtin.Type.Array) type {
+    return if (arr.sentinel()) |sentinel|
+        [arr.len:sentinel]arr.child
+    else
+        [arr.len]arr.child;
+}
+
+pub fn Optional(opt: std.builtin.Type.Optional) type {
+    return ?opt.child;
+}
+
+pub fn pointerAttributes(ptr: std.builtin.Type.Pointer) std.builtin.Type.Pointer.Attributes {
+    return .{
+        .@"addrspace" = ptr.address_space,
+        .@"align" = ptr.alignment,
+        .@"const" = ptr.is_const,
+        .@"allowzero" = ptr.is_allowzero,
+        .@"volatile" = ptr.is_volatile,
+    };
+}
+
+pub fn Pointer(ptr: std.builtin.Type.Pointer) type {
+    return @Pointer(ptr.size, pointerAttributes(ptr), ptr.child, ptr.sentinel());
+}
+
+pub fn Union(uni: std.builtin.Type.Union) type {
+    var names: [uni.fields.len][]const u8 = undefined;
+    var tTypes: [uni.fields.len]type = undefined;
+    var fieldAttrs: [uni.fields.len]std.builtin.Type.UnionField.Attributes = undefined;
+    for (&names, &fieldAttrs, &tTypes, uni.fields) |*name, *fieldAttr, *tType, *field| {
+        name.* = field.name;
+        tType.* = field.type;
+        fieldAttr.* = .{ .@"align" = field.alignment };
     }
-    return @Type(.{
-        .@"enum" = .{
-            .tag_type = std.math.IntFittingRange(0, field_infos.len),
-            .fields = &enumFields,
-            .decls = &decls,
-            .is_exhaustive = true,
-        },
-    });
+
+    return @Union(uni.layout, uni.tag_type, &names, &tTypes, &fieldAttrs);
 }

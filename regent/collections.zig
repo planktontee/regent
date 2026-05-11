@@ -261,10 +261,13 @@ pub const ComptSb = struct {
     s: []const u8,
 
     pub fn init(s: []const u8) *@This() {
-        var b: @This() = .{
-            .s = s,
-        };
-        return &b;
+        comptime {
+            var b: @This() = .{
+                .s = s,
+            };
+            return &b;
+        }
+        unreachable;
     }
 
     pub fn initTup(tup: anytype) *@This() {
