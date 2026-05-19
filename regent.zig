@@ -5,6 +5,8 @@ pub const result = @import("regent/result.zig");
 pub const testing = @import("regent/testing.zig");
 pub const ergo = @import("regent/ergo.zig");
 pub const io = @import("regent/io.zig");
+pub const dir = @import("regent/dir.zig");
+pub const linux = @import("regent/linux.zig");
 
 comptime {
     _ = collections;
@@ -14,4 +16,6 @@ comptime {
     _ = testing;
     _ = ergo;
     _ = io;
+    _ = dir;
+    _ = linux;
 }

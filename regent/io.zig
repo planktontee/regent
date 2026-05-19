@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ergo = @import("ergo.zig");
 const units = @import("units.zig");
+const rlinux = @import("linux.zig");
 const Context = ergo.Context;
 const File = std.Io.File;
 const Io = std.Io;
@@ -9,7 +10,7 @@ const Allocator = std.mem.Allocator;
 const assertM = ergo.assertM;
 const assert = std.debug.assert;
 
-const io = @This();
+const rIO = @This();
 
 pub const BufferType = enum {
     full,
@@ -17,18 +18,12 @@ pub const BufferType = enum {
     mmap,
 };
 
-pub const ExtraOptions = packed struct {
-    oDirect: bool = false,
-    expandPipe: bool = true,
-    followSymlink: bool = true,
-};
-
-pub const OpenMode = enum {
+pub const Mode = enum {
     write,
     read,
 };
 
-const bufferAlignment = std.mem.Alignment.fromByteUnits(std.simd.suggestVectorLengthForCpu(u8, builtin.cpu) orelse 8);
+pub const bufferAlignment = std.mem.Alignment.fromByteUnits(std.simd.suggestVectorLengthForCpu(u8, builtin.cpu) orelse 8);
 const oDirectAlignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize());
 const blockAlignment = std.mem.Alignment.fromByteUnits(4 * units.ByteUnit.kb);
 fn resolveAlignment(comptime oDirect: bool) std.mem.Alignment {
@@ -73,64 +68,40 @@ const defaultWriterBufferConfig: BufferConfig = .{
     .unixSocketBuff = 32 * units.ByteUnit.kb,
 };
 
-pub const OpenConfig = struct {
-    extraOptions: ExtraOptions = .{},
-    // Not to be confused with std.Io.Dir.OpenFileOptions.Mode
-    // this guy makes far less sense than std.Io.Dir.OpenFileOptions.Mode because its tied ot the return of open
-    // rather than the way the file is opened, the reason for that is convenience, you can use
-    // open(...) to open a file with .read_write and get a writer and then call openIo with .openMode = .reader
-    // to get a writer without reopening the fd
-    mode: OpenMode = .read,
+pub fn defaultBufferConfig(mode: Mode) BufferConfig {
+    return switch (mode) {
+        .read => defaultReaderBufferConfig,
+        .write => defaultWriterBufferConfig,
+    };
+}
 
-    fn convertMode(self: @This()) std.Io.Dir.OpenFileOptions.Mode {
-        return switch (self.mode) {
+pub const OpenConfig = struct {
+    oDirect: bool = false,
+    expandPipe: bool = true,
+    followSymlink: bool = true,
+
+    fn convertMode(mode: Mode) std.Io.Dir.OpenFileOptions.Mode {
+        return switch (mode) {
             .read => .read_only,
             .write => .write_only,
         };
     }
 
-    pub fn validate(self: @This(), openFileOptions: std.Io.Dir.OpenFileOptions) OpenError!void {
-        if (openFileOptions.mode != self.convertMode())
+    pub fn validate(_: @This(), mode: Mode, openFileOptions: std.Io.Dir.OpenFileOptions) OpenError!void {
+        if (openFileOptions.mode != convertMode(mode))
             return OpenError.MismatchingOpenFileOptionsAndConfig;
     }
 
-    pub fn makeOpenFileOptions(self: @This()) std.Io.Dir.OpenFileOptions {
+    pub fn toOpenFileOptions(self: @This(), mode: Mode) std.Io.Dir.OpenFileOptions {
         return .{
-            .mode = self.convertMode(),
-            .follow_symlinks = self.extraOptions.followSymlink,
-        };
-    }
-
-    pub fn bufferConfig(self: @This()) BufferConfig {
-        return switch (self.mode) {
-            .read => defaultReaderBufferConfig,
-            .write => defaultWriterBufferConfig,
+            .mode = convertMode(mode),
+            .follow_symlinks = self.followSymlink,
         };
     }
 };
 
-pub const ExtraFlagsError = error{FailedToSetExtraFlags};
-
-pub const OpenError = error{
-    FileCannotBeOpenedForRead,
-    MismatchingOpenFileOptionsAndConfig,
-    TBA,
-} ||
-    ExtraFlagsError ||
-    std.Io.File.StatError ||
-    std.Io.File.OpenError ||
-    std.mem.Allocator.Error ||
-    std.posix.MMapError;
-
-fn setODirect(fd: std.c.fd_t) ExtraFlagsError!void {
-    const flags: i64 = @bitCast(std.os.linux.fcntl(fd, std.os.linux.F.GETFL, 0));
-    if (flags < 0) return ExtraFlagsError.FailedToSetExtraFlags;
-
-    var o: std.os.linux.O = @bitCast(@as(i32, @intCast(flags)));
-    o.DIRECT = true;
-
-    const rc: i64 = @bitCast(std.os.linux.fcntl(fd, std.os.linux.F.SETFL, @intCast(@as(u32, @bitCast(o)))));
-    if (rc < 0) return ExtraFlagsError.FailedToSetExtraFlags;
+fn setODirect(io: Io, fd: std.os.linux.fd_t) rlinux.SetFdStatusFlagsError!void {
+    try rlinux.setFdStatusFlags(io, fd, .{ .DIRECT = true });
 }
 
 fn alignODirectSize(size: usize) usize {
@@ -138,7 +109,7 @@ fn alignODirectSize(size: usize) usize {
     return (size + x) & ~x;
 }
 
-fn openR(comptime mode: OpenMode) type {
+fn StreamT(comptime mode: Mode) type {
     return switch (mode) {
         .read => std.Io.File.Reader,
         .write => std.Io.File.Writer,
@@ -150,115 +121,121 @@ pub fn cwdOpen(stdio: std.Io, path: []const u8, options: std.Io.Dir.OpenFileOpti
     return try cwd.openFile(stdio, path, options);
 }
 
+pub fn expandPipeSize(io: Io, fd: std.os.linux.fd_t, maxSize: usize) bool {
+    return if (rlinux.fcntlSetPipeSZ(io, fd, maxSize)) true else |_| false;
+}
+
+pub const OpenError = error{
+    FileCannotBeOpenedForRead,
+    MismatchingOpenFileOptionsAndConfig,
+    TBA,
+} ||
+    rlinux.SetFdStatusFlagsError ||
+    std.Io.File.StatError ||
+    std.Io.File.OpenError ||
+    std.mem.Allocator.Error ||
+    std.posix.MMapError;
+
 pub fn open(
     context: Context,
     path: []const u8,
-    comptime openConfig: OpenConfig,
+    comptime mode: Mode,
+    openConfig: OpenConfig,
     openFileOptions: std.Io.Dir.OpenFileOptions,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
-) OpenError!openR(openConfig.mode) {
+) OpenError!StreamT(mode) {
     const file = try cwdOpen(context.io, path, openFileOptions);
     errdefer file.close(context.io);
 
     return try openStream(
         context,
         file,
+        mode,
         openConfig,
         bufferType,
         bufferConfig,
     );
 }
 
+// Im gonna have to find a way to move Stat out of this method
+// Also I will have to change the File.Stat call to a posix.syscall instead to bypass the
+// zig parser
+// stat has to be Io'd
 pub fn openStream(
     context: Context,
     file: File,
-    comptime openConfig: OpenConfig,
+    comptime mode: Mode,
+    openConfig: OpenConfig,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
-) OpenError!openR(openConfig.mode) {
-    const T = openR(openConfig.mode);
-    const openStreamingF: fn (File, std.Io, []u8) T = switch (openConfig.mode) {
+) OpenError!StreamT(mode) {
+    const T = StreamT(mode);
+    const openStreamingF: fn (File, std.Io, []u8) T = switch (mode) {
         .read => File.readerStreaming,
         .write => File.writerStreaming,
     };
-    const openF: fn (File, std.Io, []u8) T = switch (openConfig.mode) {
+    const openF: fn (File, std.Io, []u8) T = switch (mode) {
         .read => File.reader,
         .write => File.writer,
     };
 
-    const oDirect = openConfig.extraOptions.oDirect;
+    const oDirect = openConfig.oDirect;
     const stat = try file.stat(context.io);
     switch (stat.kind) {
         .character_device,
         => {
             // Absolutely nothing fancy to do here, char devices are incredibly simple
             // and this is tty oriented, this might be a giant waste for other char devices
-            return openStreamingF(
-                file,
-                context.io,
-                try context.allocator.alignedAlloc(
-                    u8,
-                    bufferAlignment,
-                    bufferConfig.charDeviceBuff,
-                ),
-            );
+            return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                u8,
+                bufferAlignment,
+                bufferConfig.charDeviceBuff,
+            ));
         },
         .named_pipe,
         => {
             var pipeSize: usize = bufferConfig.defaultPipeSize;
-            if (openConfig.extraOptions.expandPipe) {
+            if (openConfig.expandPipe) {
                 // Attempt to set pipesize to 1mb, this is best effort
-                const rc: i64 = @bitCast(std.os.linux.fcntl(file.handle, std.os.linux.F.SETPIPE_SZ, bufferConfig.maxPipeSize));
-                if (rc > 0) pipeSize = bufferConfig.defaultPipeSize;
+                if (expandPipeSize(context.io, file.handle, bufferConfig.maxPipeSize))
+                    pipeSize = bufferConfig.maxPipeSize;
             }
 
             // ODirect and types are ignored since pipes can only be read buffered
-            return openStreamingF(
-                file,
-                context.io,
-                try context.allocator.alignedAlloc(
-                    u8,
-                    bufferAlignment,
-                    pipeSize,
-                ),
-            );
+            return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                u8,
+                bufferAlignment,
+                pipeSize,
+            ));
         },
         .unix_domain_socket,
         => {
             // ODirect and types are ignored since pipes can only be read buffered
-            return openStreamingF(
-                file,
-                context.io,
-                try context.allocator.alignedAlloc(
-                    u8,
-                    bufferAlignment,
-                    bufferConfig.unixSocketBuff,
-                ),
-            );
+            return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                u8,
+                bufferAlignment,
+                bufferConfig.unixSocketBuff,
+            ));
         },
         .block_device,
         => {
             switch (bufferType) {
                 // Block devices dont return size on stat, so they have to be queried some other way
                 // mmap and direct works
-                .full,
-                => return OpenError.TBA,
+                .full => return OpenError.TBA,
                 .byte,
                 => {
-                    if (oDirect) try setODirect(file.handle);
-                    return openF(
-                        file,
-                        context.io,
-                        try context.allocator.alignedAlloc(
-                            u8,
-                            blockAlignment,
-                            if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else bufferConfig.blockBufferSize,
-                        ),
-                    );
+                    if (oDirect) try setODirect(context.io, file.handle);
+                    return openF(file, context.io, try context.allocator.alignedAlloc(
+                        u8,
+                        blockAlignment,
+                        if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else r: {
+                            break :r bufferConfig.blockBufferSize;
+                        },
+                    ));
                 },
-                .mmap,
-                => return OpenError.TBA,
+                .mmap => return OpenError.TBA,
             }
         },
         .file,
@@ -266,29 +243,42 @@ pub fn openStream(
             switch (bufferType) {
                 .full,
                 => {
-                    if (oDirect) try setODirect(file.handle);
-                    return openF(
-                        file,
-                        context.io,
-                        try context.allocator.alignedAlloc(
+                    if (oDirect) {
+                        try setODirect(context.io, file.handle);
+                        return openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
-                            resolveAlignment(oDirect),
+                            resolveAlignment(true),
                             if (oDirect) alignODirectSize(stat.size) else stat.size,
-                        ),
-                    );
+                        ));
+                    } else {
+                        try setODirect(context.io, file.handle);
+                        return openF(file, context.io, try context.allocator.alignedAlloc(
+                            u8,
+                            resolveAlignment(false),
+                            if (oDirect) alignODirectSize(stat.size) else stat.size,
+                        ));
+                    }
                 },
                 .byte,
                 => {
-                    if (oDirect) try setODirect(file.handle);
-                    return openF(
-                        file,
-                        context.io,
-                        try context.allocator.alignedAlloc(
+                    if (oDirect) {
+                        try setODirect(context.io, file.handle);
+                        return openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
-                            resolveAlignment(oDirect),
-                            if (oDirect) alignODirectSize(bufferConfig.fileBufferSize) else bufferConfig.fileBufferSize,
-                        ),
-                    );
+                            resolveAlignment(true),
+                            if (oDirect) alignODirectSize(bufferConfig.fileBufferSize) else r: {
+                                break :r bufferConfig.fileBufferSize;
+                            },
+                        ));
+                    } else {
+                        return openF(file, context.io, try context.allocator.alignedAlloc(
+                            u8,
+                            resolveAlignment(false),
+                            if (oDirect) alignODirectSize(bufferConfig.fileBufferSize) else r: {
+                                break :r bufferConfig.fileBufferSize;
+                            },
+                        ));
+                    }
                 },
                 .mmap,
                 => {
@@ -319,31 +309,7 @@ pub fn openStream(
     }
 }
 
-pub fn fadvise(comptime openConfig: OpenConfig, fileStream: openR(openConfig.mode), comptime flags: anytype) void {
-    if (fileStream.size == null) return;
-    const compMessage: []const u8 = "regent.io.fadvise only supports comptime_int mapped inside std.c.POSIX_FADV\n";
-    const FlagsT = @TypeOf(flags);
-    const FlagsTInfo = @typeInfo(@TypeOf(flags));
-    var tupleFlags = flags;
-
-    if (FlagsT == comptime_int) tupleFlags = .{flags};
-    if (FlagsTInfo == .@"struct" and FlagsTInfo.@"struct".is_tuple) {
-        inline for (FlagsTInfo.@"struct".fields) |field| {
-            if (@typeInfo(field.type) != .int) @compileError(compMessage);
-
-            _ = std.os.linux.fadvise(
-                fileStream.file.handle,
-                0,
-                @bitCast(fileStream.size.?),
-                field.defaultValue().?,
-            );
-        }
-    } else {
-        @compileError(compMessage);
-    }
-}
-
-pub fn close(context: Context, comptime openConfig: OpenConfig, bufferType: BufferType, fileStream: openR(openConfig.mode)) void {
+pub fn close(context: Context, bufferType: BufferType, fileStream: anytype) void {
     fileStream.file.close(context.io);
 
     switch (bufferType) {
@@ -355,27 +321,26 @@ pub fn close(context: Context, comptime openConfig: OpenConfig, bufferType: Buff
     }
 }
 
-pub fn FileStream(openConfig: OpenConfig) type {
+pub fn FileStream(mode: Mode) type {
     return struct {
-        fileStream: openR(openConfig.mode),
+        stream: StreamT(mode),
         bufferType: BufferType = DefaultBufferType,
 
-        const DefaultBufferType: BufferType = .byte;
+        pub const DefaultBufferType: BufferType = .byte;
 
         pub fn open(
             context: Context,
             path: []const u8,
         ) OpenError!@This() {
-            const openFileOptions = openConfig.makeOpenFileOptions();
-            try openConfig.validate(openFileOptions);
+            const openConfig: OpenConfig = .{};
             return .{
-                .fileStream = try io.open(
+                .stream = try rIO.open(
                     context,
                     path,
                     openConfig,
-                    openFileOptions,
+                    openConfig.toOpenFileOptions(mode),
                     DefaultBufferType,
-                    openConfig.bufferConfig(),
+                    defaultBufferConfig(mode),
                 ),
                 .bufferType = DefaultBufferType,
             };
@@ -385,30 +350,33 @@ pub fn FileStream(openConfig: OpenConfig) type {
             context: Context,
             file: File,
         ) OpenError!@This() {
+            const openConfig: OpenConfig = .{};
             return .{
-                .fileStream = try io.openStream(
+                .stream = try rIO.openStream(
                     context,
                     file,
                     openConfig,
                     DefaultBufferType,
-                    openConfig.bufferConfig(),
+                    defaultBufferConfig(mode),
                 ),
                 .bufferType = DefaultBufferType,
             };
         }
 
-        pub fn openWithBufferConfig(
+        pub fn openWithConfig(
             context: Context,
             path: []const u8,
+            openConfig: OpenConfig,
             openFileOptions: std.Io.Dir.OpenFileOptions,
             bufferType: BufferType,
             bufferConfig: BufferConfig,
         ) OpenError!@This() {
-            try openConfig.validate(openFileOptions);
+            try openConfig.validate(mode, openFileOptions);
             return .{
-                .fileStream = try io.open(
+                .stream = try rIO.open(
                     context,
                     path,
+                    mode,
                     openConfig,
                     openFileOptions,
                     bufferType,
@@ -418,16 +386,18 @@ pub fn FileStream(openConfig: OpenConfig) type {
             };
         }
 
-        pub fn openStreamWithBufferConfig(
+        pub fn openStreamWithConfig(
             context: Context,
             file: File,
+            openConfig: OpenConfig,
             bufferType: BufferType,
             bufferConfig: BufferConfig,
         ) OpenError!@This() {
             return .{
-                .fileStream = try io.openStream(
+                .stream = try rIO.openStream(
                     context,
                     file,
+                    mode,
                     openConfig,
                     bufferType,
                     bufferConfig,
@@ -436,17 +406,35 @@ pub fn FileStream(openConfig: OpenConfig) type {
             };
         }
 
-        pub fn fadvise(self: @This(), comptime flags: anytype) void {
-            io.fadvise(openConfig, self.fileStream, flags);
+        pub fn fadvise(
+            self: @This(),
+            context: Context,
+            offset: usize,
+            len: usize,
+            flags: []const rlinux.FADVISE,
+        ) void {
+            for (flags) |flag| {
+                rlinux.fadvise(
+                    context.io,
+                    self.stream.file.handle,
+                    offset,
+                    len,
+                    flag,
+                ) catch continue;
+            }
         }
 
         pub fn close(self: @This(), context: Context) void {
-            io.close(context, openConfig, self.bufferType, self.fileStream);
+            rIO.close(
+                context,
+                self.bufferType,
+                self.stream,
+            );
         }
     };
 }
 
-pub fn FileCursor(openConfig: OpenConfig) type {
+pub fn FileCursor(mode: Mode) type {
     return struct {
         paths: []const []const u8,
         i: usize = 0,
@@ -469,32 +457,41 @@ pub fn FileCursor(openConfig: OpenConfig) type {
             return self.i < self.paths.len;
         }
 
-        pub fn next(self: *@This(), context: Context) OpenError!?FileStream(openConfig) {
-            return try self.nextWithBuffConfig(
+        pub fn next(self: *@This(), context: Context) OpenError!?FileStream(mode) {
+            return try self.nextWithConfig(
                 context,
-                FileStream(openConfig).DefaultBufferType,
-                openConfig.bufferConfig(),
+                .{},
+                FileStream(mode).DefaultBufferType,
+                defaultBufferConfig(mode),
             );
         }
 
-        pub fn nextWithBuffConfig(self: *@This(), context: Context, bufferType: BufferType, bufferConfig: BufferConfig) OpenError!?FileStream(openConfig) {
+        pub fn nextWithConfig(
+            self: *@This(),
+            context: Context,
+            openConfig: OpenConfig,
+            bufferType: BufferType,
+            bufferConfig: BufferConfig,
+        ) OpenError!?FileStream(mode) {
             const path = self.peekPath() orelse return null;
             // On error we move forward, which is fine
             defer self.i += 1;
 
             if (std.mem.eql(u8, "-", path)) {
-                return try .openStreamWithBufferConfig(
+                return try .openStreamWithConfig(
                     context,
                     std.Io.File.stdin(),
+                    openConfig,
                     bufferType,
                     bufferConfig,
                 );
             }
 
-            return try .openWithBufferConfig(
+            return try .openWithConfig(
                 context,
                 path,
-                openConfig.makeOpenFileOptions(),
+                openConfig,
+                openConfig.toOpenFileOptions(mode),
                 bufferType,
                 bufferConfig,
             );
