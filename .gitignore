@@ -2,3 +2,4 @@ zig-out
 .zig-cache
 regent.zip
 zig-pkg
+test

@@ -9,6 +9,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assertM = ergo.assertM;
 const assert = std.debug.assert;
+const rDir = @import("dir.zig");
 
 const rIO = @This();
 
@@ -116,9 +117,9 @@ fn StreamT(comptime mode: Mode) type {
     };
 }
 
-pub fn cwdOpen(stdio: std.Io, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!File {
+pub fn cwdOpen(io: std.Io, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!File {
     const cwd = std.Io.Dir.cwd();
-    return try cwd.openFile(stdio, path, options);
+    return try cwd.openFile(io, path, options);
 }
 
 pub fn expandPipeSize(io: Io, fd: std.os.linux.fd_t, maxSize: usize) bool {
@@ -438,26 +439,34 @@ pub fn FileCursor(mode: Mode) type {
     return struct {
         paths: []const []const u8,
         i: usize = 0,
+        recursive: bool = false,
+        cursor: ?rDir.Walker = null,
+        lastEntry: ?rDir.Walker.Entry = null,
 
-        pub fn init(paths: []const []const u8) @This() {
-            return .{ .paths = paths };
+        pub fn init(paths: []const []const u8, recursive: bool) @This() {
+            return .{ .paths = paths, .recursive = recursive };
         }
 
-        pub fn lastPath(self: @This()) ?[]const u8 {
+        // I know this sounds like I'm huffing paint thinner with this return
+        // but I would rather copy 2 entries than make a single string with the stub
+        pub fn lastPath(self: @This()) ?[2][]const u8 {
             if (self.i < 1 or self.i > self.paths.len) return null;
-            return self.paths[self.i - 1];
-        }
+            if (self.lastEntry) |entry| return .{
+                self.paths[self.i - 1],
+                entry.path,
+            };
 
-        pub fn peekPath(self: @This()) ?[]const u8 {
-            if (self.i >= self.paths.len) return null;
-            return self.paths[self.i];
+            return .{
+                self.paths[self.i - 1],
+                "",
+            };
         }
 
         pub fn hasNext(self: *@This()) bool {
             return self.i < self.paths.len;
         }
 
-        pub fn next(self: *@This(), context: Context) OpenError!?FileStream(mode) {
+        pub fn next(self: *@This(), context: Context) !?FileStream(mode) {
             return try self.nextWithConfig(
                 context,
                 .{},
@@ -472,29 +481,88 @@ pub fn FileCursor(mode: Mode) type {
             openConfig: OpenConfig,
             bufferType: BufferType,
             bufferConfig: BufferConfig,
-        ) OpenError!?FileStream(mode) {
-            const path = self.peekPath() orelse return null;
-            // On error we move forward, which is fine
-            defer self.i += 1;
+        ) !?FileStream(mode) {
+            pathLoop: while (true) {
+                if (self.cursor) |*cursor| {
+                    while (true) {
+                        if (cursor.next(context.io) catch continue) |entry| {
+                            switch (entry.kind) {
+                                .sym_link, .directory => continue,
+                                else => {
+                                    const file = try entry.dir.openFile(context.io, entry.basename, .{});
+                                    self.lastEntry = entry;
 
-            if (std.mem.eql(u8, "-", path)) {
-                return try .openStreamWithConfig(
-                    context,
-                    std.Io.File.stdin(),
-                    openConfig,
-                    bufferType,
-                    bufferConfig,
-                );
+                                    return try .openStreamWithConfig(
+                                        context,
+                                        file,
+                                        openConfig,
+                                        bufferType,
+                                        bufferConfig,
+                                    );
+                                },
+                            }
+                        } else {
+                            self.cursor.?.deinit();
+                            self.cursor = null;
+                            self.lastEntry = null;
+                            self.i += 1;
+                            continue :pathLoop;
+                        }
+                    }
+                }
+
+                if (self.i >= self.paths.len) return null;
+                const path = self.paths[self.i];
+                if (std.mem.eql(u8, "-", path)) {
+                    @branchHint(.unlikely);
+                    self.i += 1;
+                    return try .openStreamWithConfig(
+                        context,
+                        std.Io.File.stdin(),
+                        openConfig,
+                        bufferType,
+                        bufferConfig,
+                    );
+                }
+
+                const cwd = std.Io.Dir.cwd();
+                const maybeFile = try cwd.openFile(context.io, path, .{});
+                const stat = try maybeFile.stat(context.io);
+                switch (stat.kind) {
+                    .directory, .sym_link => {
+                        if (self.recursive) {
+                            maybeFile.close(context.io);
+
+                            const dir = try cwd.openDir(context.io, path, .{ .iterate = true });
+                            self.cursor = try rDir.walk(context.io, dir, context.allocator);
+                            self.i += 1;
+
+                            continue :pathLoop;
+                        } else {
+                            self.i += 1;
+                            return error.FileCannotBeOpenedForRead;
+                        }
+                    },
+                    else => {
+                        self.i += 1;
+                        return try .openWithConfig(
+                            context,
+                            path,
+                            openConfig,
+                            openConfig.toOpenFileOptions(mode),
+                            bufferType,
+                            bufferConfig,
+                        );
+                    },
+                }
             }
+        }
 
-            return try .openWithConfig(
-                context,
-                path,
-                openConfig,
-                openConfig.toOpenFileOptions(mode),
-                bufferType,
-                bufferConfig,
-            );
+        pub fn deinit(self: *@This(), context: Context) void {
+            if (self.cursor) |cursor| {
+                cursor.deinit(context.allocator);
+            }
+            self.cursor = null;
         }
     };
 }
