@@ -129,6 +129,7 @@ pub fn expandPipeSize(io: Io, fd: std.os.linux.fd_t, maxSize: usize) bool {
 pub const OpenError = error{
     FileCannotBeOpenedForRead,
     MismatchingOpenFileOptionsAndConfig,
+    MMapUsedInStreamingFd,
     TBA,
 } ||
     rlinux.SetFdStatusFlagsError ||
@@ -186,6 +187,8 @@ pub fn openStream(
     switch (stat.kind) {
         .character_device,
         => {
+            if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
+
             // Absolutely nothing fancy to do here, char devices are incredibly simple
             // and this is tty oriented, this might be a giant waste for other char devices
             return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
@@ -196,6 +199,8 @@ pub fn openStream(
         },
         .named_pipe,
         => {
+            if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
+
             var pipeSize: usize = bufferConfig.defaultPipeSize;
             if (openConfig.expandPipe) {
                 // Attempt to set pipesize to 1mb, this is best effort
@@ -212,6 +217,7 @@ pub fn openStream(
         },
         .unix_domain_socket,
         => {
+            if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
             // ODirect and types are ignored since pipes can only be read buffered
             return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                 u8,
@@ -249,14 +255,13 @@ pub fn openStream(
                         return openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
                             resolveAlignment(true),
-                            if (oDirect) alignODirectSize(stat.size) else stat.size,
+                            alignODirectSize(stat.size),
                         ));
                     } else {
-                        try setODirect(context.io, file.handle);
                         return openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
                             resolveAlignment(false),
-                            if (oDirect) alignODirectSize(stat.size) else stat.size,
+                            stat.size,
                         ));
                     }
                 },
@@ -267,17 +272,13 @@ pub fn openStream(
                         return openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
                             resolveAlignment(true),
-                            if (oDirect) alignODirectSize(bufferConfig.fileBufferSize) else r: {
-                                break :r bufferConfig.fileBufferSize;
-                            },
+                            alignODirectSize(bufferConfig.fileBufferSize),
                         ));
                     } else {
                         return openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
                             resolveAlignment(false),
-                            if (oDirect) alignODirectSize(bufferConfig.fileBufferSize) else r: {
-                                break :r bufferConfig.fileBufferSize;
-                            },
+                            bufferConfig.fileBufferSize,
                         ));
                     }
                 },
@@ -285,7 +286,8 @@ pub fn openStream(
                 => {
                     const ptr = try std.posix.mmap(
                         null,
-                        @intCast(stat.size),
+                        // MMAP fails with 0, so min has to 1
+                        @max(@as(usize, @intCast(stat.size)), 1),
                         .{ .READ = true },
                         .{ .TYPE = .PRIVATE },
                         file.handle,
@@ -490,6 +492,7 @@ pub fn FileCursor(mode: Mode) type {
                                 .sym_link, .directory => continue,
                                 else => {
                                     const file = try entry.dir.openFile(context.io, entry.basename, .{});
+                                    errdefer file.close(context.io);
                                     self.lastEntry = entry;
 
                                     return try .openStreamWithConfig(
@@ -526,7 +529,8 @@ pub fn FileCursor(mode: Mode) type {
                 }
 
                 const cwd = std.Io.Dir.cwd();
-                const maybeFile = try cwd.openFile(context.io, path, .{});
+                const maybeFile = try cwd.openFile(context.io, path, openConfig.toOpenFileOptions(.read));
+                errdefer maybeFile.close(context.io);
                 const stat = try maybeFile.stat(context.io);
                 switch (stat.kind) {
                     .directory, .sym_link => {
@@ -534,22 +538,24 @@ pub fn FileCursor(mode: Mode) type {
                             maybeFile.close(context.io);
 
                             const dir = try cwd.openDir(context.io, path, .{ .iterate = true });
+                            errdefer dir.close(context.io);
+
                             self.cursor = try rDir.walk(context.io, dir, context.allocator);
                             self.i += 1;
 
                             continue :pathLoop;
                         } else {
+                            maybeFile.close(context.io);
                             self.i += 1;
                             return error.FileCannotBeOpenedForRead;
                         }
                     },
                     else => {
                         self.i += 1;
-                        return try .openWithConfig(
+                        return try .openStreamWithConfig(
                             context,
-                            path,
+                            maybeFile,
                             openConfig,
-                            openConfig.toOpenFileOptions(mode),
                             bufferType,
                             bufferConfig,
                         );

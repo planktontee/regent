@@ -33,42 +33,60 @@ pub const CappedStrLenError = error{
     StringTooLong,
 };
 
-pub fn strlenCapped(ptr: [*]const u8, cap: usize) CappedStrLenError!usize {
-    if (std.simd.suggestVectorLength(u8)) |VLen| {
-        const Vec = @Vector(VLen, u8);
-        const zeroVec: Vec = @splat(0);
+pub fn strlenCapped(p: [*]const u8, cap: usize) CappedStrLenError!usize {
+    if (std.simd.suggestVectorLength(u8)) |blockLen| {
+        const blockSize = @sizeOf(u8) * blockLen;
+        const Block = @Vector(blockLen, u8);
+        const mask: Block = @splat(0);
 
-        const page = std.heap.pageSize();
-        const distanceToPage = page - (@intFromPtr(ptr) & (page - 1));
+        const pageSize = std.heap.pageSize();
 
-        if (distanceToPage < VLen) {
-            var ptrAux = ptr;
-            var i: usize = 0;
-            while (i < distanceToPage) : (i += 1) {
-                if (i > cap) return CappedStrLenError.StringTooLong;
-                if (ptrAux[0] == 0) return i;
-                ptrAux += 1;
+        var i: usize = 0;
+        const start_addr = @intFromPtr(&p[i]);
+        const offset_in_page = start_addr & (pageSize - 1);
+        if (offset_in_page <= pageSize - @sizeOf(Block)) {
+            // Will not read past the end of a page, full block.
+            const block: Block = p[i..][0..blockLen].*;
+            const matches = block == mask;
+            if (@reduce(.Or, matches)) {
+                i += std.simd.firstTrue(matches).?;
+                if (i > cap) return error.StringTooLong;
+            }
+
+            i += @divExact(std.mem.alignForward(usize, start_addr, blockSize) - start_addr, @sizeOf(u8));
+            if (i > cap) return error.StringTooLong;
+        } else {
+            @branchHint(.unlikely);
+            // Would read over a page boundary. Per-byte at a time until aligned or found.
+            // 0.39% chance this branch is taken for 4K pages at 16b block length.
+            //
+            // An alternate strategy is to do read a full block (the last in the page) and
+            // mask the entries before the pointer.
+            while ((@intFromPtr(&p[i]) & (blockSize - 1)) != 0) : (i += 1) {
+                if (i > cap) return error.StringTooLong;
+                if (p[i] == 0) return i;
             }
         }
 
-        var ptrAux = ptr;
-        var i: usize = 0;
+        std.debug.assertAligned(&p[i], .fromByteUnits(blockSize));
         while (true) {
-            if (i > cap) return CappedStrLenError.StringTooLong;
-            const chunk: Vec = @as(*const [VLen]u8, @ptrCast(ptrAux)).*;
-            const match = chunk == zeroVec;
-            if (std.simd.firstTrue(match)) |idx| return i + idx;
-            ptrAux += VLen;
-            i += VLen;
+            const block: Block = p[i..][0..blockLen].*;
+            const matches = block == mask;
+            if (@reduce(.Or, matches)) {
+                i += std.simd.firstTrue(matches).?;
+                if (i > cap) return error.StringTooLong;
+            }
+            i += blockLen;
+            if (i > cap) return error.StringTooLong;
         }
     } else {
-        var ptrAux = ptr;
+        var ptrAux = p;
         var i: usize = 0;
         while (i <= cap) : (i += 1) {
             if (ptrAux[0] == 0) return i;
             ptrAux += 1;
         }
-        return CappedStrLenError.StringTooLong;
+        return error.StringTooLong;
     }
 }
 

@@ -3,9 +3,6 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const File = Io.File;
 const Allocator = std.mem.Allocator;
-const fs = @import("fs.zig");
-const units = @import("units.zig");
-const Context = @import("ergo.zig").Context;
 const linux = std.os.linux;
 const assert = std.debug.assert;
 const rlinux = @import("linux.zig");
@@ -231,8 +228,6 @@ pub const Walker = struct {
         }
     };
 
-    pub const NextError = error{UknownFileType};
-
     /// After each call to this function, and on deinit(), the memory returned
     /// from this function becomes invalid. A copy must be made in order to keep
     /// a reference to the path.
@@ -323,14 +318,6 @@ pub fn walkSelectively(io: Io, dir: Dir, allocator: Allocator) !SelectiveWalker 
 /// * `walkSelectively`
 pub fn walk(io: Io, dir: Dir, allocator: Allocator) !Walker {
     return .{ .inner = try walkSelectively(io, dir, allocator) };
-}
-
-pub fn open(io: Io, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!File {
-    const cwd = std.Io.Dir.cwd();
-    return try cwd.openFile(io, path, options);
-
-    // const file = try cwdOpen(io, path, openFileOptions);
-    // errdefer file.close(context.io);
 }
 
 pub const statxRequest: linux.STATX = .{
