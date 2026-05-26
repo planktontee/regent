@@ -270,7 +270,7 @@ pub const Walker = struct {
 /// `dir` will not be closed after walking it.
 ///
 /// See also `walk`.
-pub fn walkSelectively(io: Io, dir: Dir, allocator: Allocator) !SelectiveWalker {
+pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator) !SelectiveWalker {
     var stack: std.ArrayList(SelectiveWalker.StackItem) = .empty;
     var visitor: @FieldType(SelectiveWalker, "visitor") = .empty;
 
@@ -289,7 +289,7 @@ pub fn walkSelectively(io: Io, dir: Dir, allocator: Allocator) !SelectiveWalker 
 
     try stack.append(allocator, .{
         .iter = Iterator.init(dir, buff, statx.mount_id),
-        .dirname_len = 0,
+        .dirname_len = startPath.len,
         .blockSize = statx.block_size,
     });
     errdefer stack.deinit(allocator);
@@ -298,7 +298,11 @@ pub fn walkSelectively(io: Io, dir: Dir, allocator: Allocator) !SelectiveWalker 
 
     return .{
         .stack = stack,
-        .name_buffer = .empty,
+        .name_buffer = if (startPath.len == 0) .empty else r: {
+            var nameBuff: std.ArrayList(u8) = .empty;
+            try nameBuff.appendSlice(allocator, startPath);
+            break :r nameBuff;
+        },
         .allocator = allocator,
         .visitor = visitor,
     };
@@ -316,8 +320,8 @@ pub fn walkSelectively(io: Io, dir: Dir, allocator: Allocator) !SelectiveWalker 
 ///
 /// See also:
 /// * `walkSelectively`
-pub fn walk(io: Io, dir: Dir, allocator: Allocator) !Walker {
-    return .{ .inner = try walkSelectively(io, dir, allocator) };
+pub fn walk(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator) !Walker {
+    return .{ .inner = try walkSelectively(io, dir, startPath, allocator) };
 }
 
 pub const statxRequest: linux.STATX = .{

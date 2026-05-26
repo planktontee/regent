@@ -443,29 +443,23 @@ pub fn FileCursor(mode: Mode) type {
         i: usize = 0,
         recursive: bool = false,
         cursor: ?rDir.Walker = null,
-        lastEntry: ?rDir.Walker.Entry = null,
+        currentEntry: ?rDir.Walker.Entry = null,
+        hasTrailingPath: bool = false,
 
         pub fn init(paths: []const []const u8, recursive: bool) @This() {
             return .{ .paths = paths, .recursive = recursive };
         }
 
-        // I know this sounds like I'm huffing paint thinner with this return
-        // but I would rather copy 2 entries than make a single string with the stub
-        pub fn lastPath(self: @This()) ?[2][]const u8 {
+        // Current path is guaranteed to be at the path that failed in case you query it
+        // after an error return
+        pub fn currentPath(self: @This()) ?[]const u8 {
             if (self.i < 1 or self.i > self.paths.len) return null;
-            if (self.lastEntry) |entry| return .{
-                self.paths[self.i - 1],
-                entry.path,
-            };
-
-            return .{
-                self.paths[self.i - 1],
-                "",
-            };
-        }
-
-        pub fn hasNext(self: *@This()) bool {
-            return self.i < self.paths.len;
+            if (self.currentEntry) |entry|
+                return entry.path
+            else {
+                const path = self.paths[self.i - 1];
+                return if (self.hasTrailingPath) path[0 .. path.len - 1] else path;
+            }
         }
 
         pub fn next(self: *@This(), context: Context) !?FileStream(mode) {
@@ -475,6 +469,15 @@ pub fn FileCursor(mode: Mode) type {
                 FileStream(mode).DefaultBufferType,
                 defaultBufferConfig(mode),
             );
+        }
+
+        fn pickPath(self: *@This()) !?[]const u8 {
+            if (self.i >= self.paths.len) return null;
+            const path = self.paths[self.i];
+            self.i += 1;
+
+            self.hasTrailingPath = path[path.len - 1] == '/';
+            return if (self.hasTrailingPath) path[0 .. path.len - 1] else path;
         }
 
         pub fn nextWithConfig(
@@ -491,9 +494,9 @@ pub fn FileCursor(mode: Mode) type {
                             switch (entry.kind) {
                                 .sym_link, .directory => continue,
                                 else => {
+                                    self.currentEntry = entry;
                                     const file = try entry.dir.openFile(context.io, entry.basename, .{});
                                     errdefer file.close(context.io);
-                                    self.lastEntry = entry;
 
                                     return try .openStreamWithConfig(
                                         context,
@@ -507,18 +510,18 @@ pub fn FileCursor(mode: Mode) type {
                         } else {
                             self.cursor.?.deinit();
                             self.cursor = null;
-                            self.lastEntry = null;
-                            self.i += 1;
+                            self.currentEntry = null;
                             continue :pathLoop;
                         }
                     }
                 }
 
-                if (self.i >= self.paths.len) return null;
-                const path = self.paths[self.i];
+                const path = try self.pickPath() orelse return null;
+                // In all cases, even if there's an error, we move to i += 1
+                // the only case where we dont do that is when we are running the cursor loop at the beginning
+                // This means any failure we move forward already
                 if (std.mem.eql(u8, "-", path)) {
                     @branchHint(.unlikely);
-                    self.i += 1;
                     return try .openStreamWithConfig(
                         context,
                         std.Io.File.stdin(),
@@ -530,8 +533,10 @@ pub fn FileCursor(mode: Mode) type {
 
                 const cwd = std.Io.Dir.cwd();
                 const maybeFile = try cwd.openFile(context.io, path, openConfig.toOpenFileOptions(.read));
-                errdefer maybeFile.close(context.io);
-                const stat = try maybeFile.stat(context.io);
+                const stat = maybeFile.stat(context.io) catch |e| {
+                    maybeFile.close(context.io);
+                    return e;
+                };
                 switch (stat.kind) {
                     .directory, .sym_link => {
                         if (self.recursive) {
@@ -540,18 +545,16 @@ pub fn FileCursor(mode: Mode) type {
                             const dir = try cwd.openDir(context.io, path, .{ .iterate = true });
                             errdefer dir.close(context.io);
 
-                            self.cursor = try rDir.walk(context.io, dir, context.allocator);
-                            self.i += 1;
+                            self.cursor = try rDir.walk(context.io, dir, path, context.allocator);
 
                             continue :pathLoop;
                         } else {
                             maybeFile.close(context.io);
-                            self.i += 1;
                             return error.FileCannotBeOpenedForRead;
                         }
                     },
                     else => {
-                        self.i += 1;
+                        errdefer maybeFile.close(context.io);
                         return try .openStreamWithConfig(
                             context,
                             maybeFile,
@@ -564,11 +567,12 @@ pub fn FileCursor(mode: Mode) type {
             }
         }
 
-        pub fn deinit(self: *@This(), context: Context) void {
-            if (self.cursor) |cursor| {
-                cursor.deinit(context.allocator);
+        pub fn deinit(self: *@This()) void {
+            if (self.cursor) |*cursor| {
+                cursor.deinit();
+                self.cursor = null;
             }
-            self.cursor = null;
+            self.currentEntry = null;
         }
     };
 }
