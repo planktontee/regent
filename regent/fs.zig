@@ -437,29 +437,42 @@ pub fn FileStream(mode: Mode) type {
     };
 }
 
+pub const FileCursorError = error{
+    FollowSymlinkDisabled,
+};
+
 pub fn FileCursor(mode: Mode) type {
     return struct {
         paths: []const []const u8,
         i: usize = 0,
-        recursive: bool = false,
         cursor: ?rDir.Walker = null,
         currentEntry: ?rDir.Walker.Entry = null,
         hasTrailingPath: bool = false,
+        recursive: bool = true,
+        followSymlink: bool = true,
 
-        pub fn init(paths: []const []const u8, recursive: bool) @This() {
-            return .{ .paths = paths, .recursive = recursive };
+        pub fn init(paths: []const []const u8) @This() {
+            return .{ .paths = paths };
+        }
+
+        pub fn initWithFlags(paths: []const []const u8, recursive: bool, followSymlink: bool) @This() {
+            return .{
+                .paths = paths,
+                .recursive = recursive,
+                .followSymlink = followSymlink,
+            };
         }
 
         // Current path is guaranteed to be at the path that failed in case you query it
         // after an error return
         pub fn currentPath(self: @This()) ?[]const u8 {
             if (self.i < 1 or self.i > self.paths.len) return null;
+
             if (self.currentEntry) |entry|
-                return entry.path
-            else {
-                const path = self.paths[self.i - 1];
-                return if (self.hasTrailingPath) path[0 .. path.len - 1] else path;
-            }
+                return entry.path;
+
+            const path = self.paths[self.i - 1];
+            return if (self.hasTrailingPath) path[0 .. path.len - 1] else path;
         }
 
         pub fn next(self: *@This(), context: Context) !?FileStream(mode) {
@@ -540,12 +553,17 @@ pub fn FileCursor(mode: Mode) type {
                 switch (stat.kind) {
                     .directory, .sym_link => {
                         if (self.recursive) {
+                            if (stat.kind == .sym_link and !self.followSymlink) {
+                                @branchHint(.unlikely);
+                                return FileCursorError.FollowSymlinkDisabled;
+                            }
+
                             maybeFile.close(context.io);
 
                             const dir = try cwd.openDir(context.io, path, .{ .iterate = true });
                             errdefer dir.close(context.io);
 
-                            self.cursor = try rDir.walk(context.io, dir, path, context.allocator);
+                            self.cursor = try rDir.walk(context.io, dir, path, context.allocator, self.followSymlink);
 
                             continue :pathLoop;
                         } else {

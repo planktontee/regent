@@ -50,6 +50,7 @@ pub const SelectiveWalker = struct {
     name_buffer: std.ArrayList(u8),
     allocator: Allocator,
     visitor: std.HashMapUnmanaged(Visitor, void, std.hash_map.AutoContext(Visitor), 95),
+    followSymlink: bool,
 
     const Visitor = struct { u64, u64 };
 
@@ -117,12 +118,13 @@ pub const SelectiveWalker = struct {
                 @branchHint(.likely);
 
                 const mountId = self.stack.items[self.stack.items.len - 1].iter.mountId;
-                if (self.visitor.contains(.{ mountId, entry.inode })) return EnterError.EntryAlreadyVisited;
+                if (self.followSymlink and self.visitor.contains(.{ mountId, entry.inode })) return EnterError.EntryAlreadyVisited;
                 try self.innerEnter(io, entry.*);
-                try self.visitor.put(self.allocator, .{ mountId, entry.inode }, {});
+                if (self.followSymlink) try self.visitor.put(self.allocator, .{ mountId, entry.inode }, {});
             },
             .sym_link => {
-                @branchHint(.likely);
+                if (!self.followSymlink) return;
+
                 const statx = fileStatLinux(
                     io,
                     entry.dir.handle,
@@ -161,6 +163,8 @@ pub const SelectiveWalker = struct {
                 return;
             },
         }
+
+        assert(entry.kind == .sym_link and self.followSymlink or entry.kind != .sym_link);
 
         //stat symlink for files
         var new_dir = entry.dir.openDir(io, entry.basename, .{ .iterate = true }) catch |err| {
@@ -270,7 +274,7 @@ pub const Walker = struct {
 /// `dir` will not be closed after walking it.
 ///
 /// See also `walk`.
-pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator) !SelectiveWalker {
+pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator, followSymlink: bool) !SelectiveWalker {
     var stack: std.ArrayList(SelectiveWalker.StackItem) = .empty;
     var visitor: @FieldType(SelectiveWalker, "visitor") = .empty;
 
@@ -294,7 +298,7 @@ pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Alloc
     });
     errdefer stack.deinit(allocator);
 
-    try visitor.put(allocator, .{ statx.mount_id, statx.inode }, {});
+    if (followSymlink) try visitor.put(allocator, .{ statx.mount_id, statx.inode }, {});
 
     return .{
         .stack = stack,
@@ -305,6 +309,7 @@ pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Alloc
         },
         .allocator = allocator,
         .visitor = visitor,
+        .followSymlink = followSymlink,
     };
 }
 
@@ -320,8 +325,8 @@ pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Alloc
 ///
 /// See also:
 /// * `walkSelectively`
-pub fn walk(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator) !Walker {
-    return .{ .inner = try walkSelectively(io, dir, startPath, allocator) };
+pub fn walk(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator, followSymlink: bool) !Walker {
+    return .{ .inner = try walkSelectively(io, dir, startPath, allocator, followSymlink) };
 }
 
 pub const statxRequest: linux.STATX = .{
