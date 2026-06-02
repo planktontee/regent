@@ -8,6 +8,8 @@ pub const fs = @import("regent/fs.zig");
 pub const dir = @import("regent/dir.zig");
 pub const linux = @import("regent/linux.zig");
 pub const xstr = @import("regent/xstr.zig");
+pub const mem = @import("regent/mem.zig");
+pub const trampoline = @import("regent/trampoline.zig");
 
 comptime {
     _ = collections;
@@ -20,4 +22,6 @@ comptime {
     _ = dir;
     _ = linux;
     _ = xstr;
+    _ = mem;
+    _ = trampoline;
 }

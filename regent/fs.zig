@@ -146,7 +146,7 @@ pub fn open(
     openFileOptions: std.Io.Dir.OpenFileOptions,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
-) OpenError!StreamT(mode) {
+) OpenError!struct { std.Io.File.Stat, StreamT(mode) } {
     const file = try cwdOpen(context.io, path, openFileOptions);
     errdefer file.close(context.io);
 
@@ -171,7 +171,7 @@ pub fn openStream(
     openConfig: OpenConfig,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
-) OpenError!StreamT(mode) {
+) OpenError!struct { std.Io.File.Stat, StreamT(mode) } {
     const T = StreamT(mode);
     const openStreamingF: fn (File, std.Io, []u8) T = switch (mode) {
         .read => File.readerStreaming,
@@ -191,11 +191,14 @@ pub fn openStream(
 
             // Absolutely nothing fancy to do here, char devices are incredibly simple
             // and this is tty oriented, this might be a giant waste for other char devices
-            return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
-                u8,
-                bufferAlignment,
-                bufferConfig.charDeviceBuff,
-            ));
+            return .{
+                stat,
+                openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                    u8,
+                    bufferAlignment,
+                    bufferConfig.charDeviceBuff,
+                )),
+            };
         },
         .named_pipe,
         => {
@@ -209,21 +212,27 @@ pub fn openStream(
             }
 
             // ODirect and types are ignored since pipes can only be read buffered
-            return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
-                u8,
-                bufferAlignment,
-                pipeSize,
-            ));
+            return .{
+                stat,
+                openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                    u8,
+                    bufferAlignment,
+                    pipeSize,
+                )),
+            };
         },
         .unix_domain_socket,
         => {
             if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
             // ODirect and types are ignored since pipes can only be read buffered
-            return openStreamingF(file, context.io, try context.allocator.alignedAlloc(
-                u8,
-                bufferAlignment,
-                bufferConfig.unixSocketBuff,
-            ));
+            return .{
+                stat,
+                openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                    u8,
+                    bufferAlignment,
+                    bufferConfig.unixSocketBuff,
+                )),
+            };
         },
         .block_device,
         => {
@@ -234,13 +243,16 @@ pub fn openStream(
                 .byte,
                 => {
                     if (oDirect) try setODirect(context.io, file.handle);
-                    return openF(file, context.io, try context.allocator.alignedAlloc(
-                        u8,
-                        blockAlignment,
-                        if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else r: {
-                            break :r bufferConfig.blockBufferSize;
-                        },
-                    ));
+                    return .{
+                        stat,
+                        openF(file, context.io, try context.allocator.alignedAlloc(
+                            u8,
+                            blockAlignment,
+                            if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else r: {
+                                break :r bufferConfig.blockBufferSize;
+                            },
+                        )),
+                    };
                 },
                 .mmap => return OpenError.TBA,
             }
@@ -252,53 +264,70 @@ pub fn openStream(
                 => {
                     if (oDirect) {
                         try setODirect(context.io, file.handle);
-                        return openF(file, context.io, try context.allocator.alignedAlloc(
-                            u8,
-                            resolveAlignment(true),
-                            alignODirectSize(stat.size),
-                        ));
+                        return .{
+                            stat,
+                            openF(file, context.io, try context.allocator.alignedAlloc(
+                                u8,
+                                resolveAlignment(true),
+                                alignODirectSize(stat.size),
+                            )),
+                        };
                     } else {
-                        return openF(file, context.io, try context.allocator.alignedAlloc(
-                            u8,
-                            resolveAlignment(false),
-                            stat.size,
-                        ));
+                        return .{
+                            stat,
+                            openF(file, context.io, try context.allocator.alignedAlloc(
+                                u8,
+                                resolveAlignment(false),
+                                stat.size,
+                            )),
+                        };
                     }
                 },
                 .byte,
                 => {
                     if (oDirect) {
                         try setODirect(context.io, file.handle);
-                        return openF(file, context.io, try context.allocator.alignedAlloc(
-                            u8,
-                            resolveAlignment(true),
-                            alignODirectSize(bufferConfig.fileBufferSize),
-                        ));
+                        return .{
+                            stat,
+                            openF(file, context.io, try context.allocator.alignedAlloc(
+                                u8,
+                                resolveAlignment(true),
+                                alignODirectSize(bufferConfig.fileBufferSize),
+                            )),
+                        };
                     } else {
-                        return openF(file, context.io, try context.allocator.alignedAlloc(
-                            u8,
-                            resolveAlignment(false),
-                            bufferConfig.fileBufferSize,
-                        ));
+                        return .{
+                            stat,
+                            openF(file, context.io, try context.allocator.alignedAlloc(
+                                u8,
+                                resolveAlignment(false),
+                                bufferConfig.fileBufferSize,
+                            )),
+                        };
                     }
                 },
                 .mmap,
                 => {
-                    const ptr = try std.posix.mmap(
-                        null,
-                        // MMAP fails with 0, so min has to 1
-                        @max(@as(usize, @intCast(stat.size)), 1),
-                        .{ .READ = true },
-                        .{ .TYPE = .PRIVATE },
-                        file.handle,
-                        0,
-                    );
+                    switch (mode) {
+                        .read => {
+                            const ptr = try std.posix.mmap(
+                                null,
+                                // MMAP fails with 0, so min has to 1
+                                @max(@as(usize, @intCast(stat.size)), 1),
+                                .{ .READ = true },
+                                .{ .TYPE = .PRIVATE },
+                                file.handle,
+                                0,
+                            );
 
-                    var stream = openF(file, context.io, ptr);
-                    stream.interface.end = stat.size;
-                    stream.pos = stat.size;
-                    stream.size = stat.size;
-                    return stream;
+                            var stream = openF(file, context.io, ptr);
+                            stream.interface.end = stat.size;
+                            stream.pos = stat.size;
+                            stream.size = stat.size;
+                            return .{ stat, stream };
+                        },
+                        .write => return error.TBA,
+                    }
                 },
             }
         },
@@ -327,6 +356,7 @@ pub fn close(context: Context, bufferType: BufferType, fileStream: anytype) void
 pub fn FileStream(mode: Mode) type {
     return struct {
         stream: StreamT(mode),
+        stat: std.Io.File.Stat,
         bufferType: BufferType = DefaultBufferType,
 
         pub const DefaultBufferType: BufferType = .byte;
@@ -336,15 +366,18 @@ pub fn FileStream(mode: Mode) type {
             path: []const u8,
         ) OpenError!@This() {
             const openConfig: OpenConfig = .{};
+            const stat, const stream = try rIO.open(
+                context,
+                path,
+                mode,
+                openConfig,
+                openConfig.toOpenFileOptions(mode),
+                DefaultBufferType,
+                defaultBufferConfig(mode),
+            );
             return .{
-                .stream = try rIO.open(
-                    context,
-                    path,
-                    openConfig,
-                    openConfig.toOpenFileOptions(mode),
-                    DefaultBufferType,
-                    defaultBufferConfig(mode),
-                ),
+                .stream = stream,
+                .stat = stat,
                 .bufferType = DefaultBufferType,
             };
         }
@@ -353,15 +386,17 @@ pub fn FileStream(mode: Mode) type {
             context: Context,
             file: File,
         ) OpenError!@This() {
-            const openConfig: OpenConfig = .{};
+            const stat, const stream = try rIO.openStream(
+                context,
+                file,
+                mode,
+                .{},
+                DefaultBufferType,
+                defaultBufferConfig(mode),
+            );
             return .{
-                .stream = try rIO.openStream(
-                    context,
-                    file,
-                    openConfig,
-                    DefaultBufferType,
-                    defaultBufferConfig(mode),
-                ),
+                .stream = stream,
+                .stat = stat,
                 .bufferType = DefaultBufferType,
             };
         }
@@ -375,16 +410,18 @@ pub fn FileStream(mode: Mode) type {
             bufferConfig: BufferConfig,
         ) OpenError!@This() {
             try openConfig.validate(mode, openFileOptions);
+            const stat, const stream = try rIO.open(
+                context,
+                path,
+                mode,
+                openConfig,
+                openFileOptions,
+                bufferType,
+                bufferConfig,
+            );
             return .{
-                .stream = try rIO.open(
-                    context,
-                    path,
-                    mode,
-                    openConfig,
-                    openFileOptions,
-                    bufferType,
-                    bufferConfig,
-                ),
+                .stream = stream,
+                .stat = stat,
                 .bufferType = bufferType,
             };
         }
@@ -396,15 +433,17 @@ pub fn FileStream(mode: Mode) type {
             bufferType: BufferType,
             bufferConfig: BufferConfig,
         ) OpenError!@This() {
+            const stat, const stream = try rIO.openStream(
+                context,
+                file,
+                mode,
+                openConfig,
+                bufferType,
+                bufferConfig,
+            );
             return .{
-                .stream = try rIO.openStream(
-                    context,
-                    file,
-                    mode,
-                    openConfig,
-                    bufferType,
-                    bufferConfig,
-                ),
+                .stream = stream,
+                .stat = stat,
                 .bufferType = bufferType,
             };
         }
