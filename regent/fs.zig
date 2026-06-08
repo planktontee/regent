@@ -196,7 +196,7 @@ pub fn openStream(
                 openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                     u8,
                     bufferAlignment,
-                    bufferConfig.charDeviceBuff,
+                    @max(1, bufferConfig.charDeviceBuff),
                 )),
             };
         },
@@ -217,7 +217,7 @@ pub fn openStream(
                 openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                     u8,
                     bufferAlignment,
-                    pipeSize,
+                    @max(1, pipeSize),
                 )),
             };
         },
@@ -230,7 +230,7 @@ pub fn openStream(
                 openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                     u8,
                     bufferAlignment,
-                    bufferConfig.unixSocketBuff,
+                    @max(1, bufferConfig.unixSocketBuff),
                 )),
             };
         },
@@ -249,7 +249,7 @@ pub fn openStream(
                             u8,
                             blockAlignment,
                             if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else r: {
-                                break :r bufferConfig.blockBufferSize;
+                                break :r @max(1, bufferConfig.blockBufferSize);
                             },
                         )),
                     };
@@ -269,7 +269,7 @@ pub fn openStream(
                             openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
                                 resolveAlignment(true),
-                                alignODirectSize(stat.size),
+                                alignODirectSize(@max(1, stat.size)),
                             )),
                         };
                     } else {
@@ -278,7 +278,7 @@ pub fn openStream(
                             openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
                                 resolveAlignment(false),
-                                stat.size,
+                                @max(1, stat.size),
                             )),
                         };
                     }
@@ -292,7 +292,7 @@ pub fn openStream(
                             openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
                                 resolveAlignment(true),
-                                alignODirectSize(bufferConfig.fileBufferSize),
+                                alignODirectSize(@max(1, bufferConfig.fileBufferSize)),
                             )),
                         };
                     } else {
@@ -301,7 +301,7 @@ pub fn openStream(
                             openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
                                 resolveAlignment(false),
-                                bufferConfig.fileBufferSize,
+                                @max(1, bufferConfig.fileBufferSize),
                             )),
                         };
                     }
@@ -480,25 +480,79 @@ pub const FileCursorError = error{
     FollowSymlinkDisabled,
 };
 
+pub const FileCursorConfig = struct {
+    recursive: bool = true,
+    followSymlink: bool = true,
+    policy: Policy = r: {
+        const p = DefaultFileCursorPolicy{};
+        break :r .{ .data = @ptrCast(@constCast(&p)), .interface = &.{
+            .open = &DefaultFileCursorPolicy.open,
+            .enter = &DefaultFileCursorPolicy.enter,
+        } };
+    },
+
+    // This is mirrored to avoid the sentinel
+    pub const PolicyEntryData = struct {
+        dir: std.Io.Dir,
+        basename: []const u8,
+        path: []const u8,
+        kind: File.Kind,
+        inode: File.INode,
+    };
+
+    pub const PolicyEntry = union(enum) {
+        // This means it's not yet handled by the walker
+        preWalkerEntry: PolicyEntryData,
+        // This means we are inside the walker (recurisve)
+        entry: rDir.Walker.Entry,
+        stdin,
+        stdout,
+        stderr,
+    };
+
+    pub const PolicyVTable = struct {
+        open: *const fn (*anyopaque, PolicyEntry) bool,
+        enter: *const fn (*anyopaque, PolicyEntry) bool,
+    };
+
+    // Policy checks happen at FileCursor.path resolution
+    // Once that's covered, they also happen after entry resolution
+    // which, means the path will get tracked through symlink (if toggled)
+    // so this isn't a visitor mechanism, this is a matching path mechanism for the
+    // return given by FileCursor.next
+    pub const Policy = struct {
+        data: *anyopaque,
+        interface: *const PolicyVTable,
+    };
+
+    pub const DefaultFileCursorPolicy = struct {
+        pub fn open(_: *anyopaque, _: PolicyEntry) bool {
+            return true;
+        }
+
+        pub fn enter(_: *anyopaque, _: PolicyEntry) bool {
+            return true;
+        }
+    };
+};
+
 pub fn FileCursor(mode: Mode) type {
     return struct {
         paths: []const []const u8,
         i: usize = 0,
+        hasTrailingPath: bool = false,
         cursor: ?rDir.Walker = null,
         currentEntry: ?rDir.Walker.Entry = null,
-        hasTrailingPath: bool = false,
-        recursive: bool = true,
-        followSymlink: bool = true,
+        config: FileCursorConfig = .{},
 
         pub fn init(paths: []const []const u8) @This() {
             return .{ .paths = paths };
         }
 
-        pub fn initWithFlags(paths: []const []const u8, recursive: bool, followSymlink: bool) @This() {
+        pub fn initWithConfig(paths: []const []const u8, config: FileCursorConfig) @This() {
             return .{
                 .paths = paths,
-                .recursive = recursive,
-                .followSymlink = followSymlink,
+                .config = config,
             };
         }
 
@@ -546,6 +600,8 @@ pub fn FileCursor(mode: Mode) type {
                             switch (entry.kind) {
                                 .sym_link, .directory => continue,
                                 else => {
+                                    if (!self.config.policy.interface.open(self.config.policy.data, .{ .entry = entry })) continue;
+
                                     self.currentEntry = entry;
                                     const file = try entry.dir.openFile(context.io, entry.basename, .{});
                                     errdefer file.close(context.io);
@@ -574,6 +630,9 @@ pub fn FileCursor(mode: Mode) type {
                 // This means any failure we move forward already
                 if (std.mem.eql(u8, "-", path)) {
                     @branchHint(.unlikely);
+
+                    if (!self.config.policy.interface.open(self.config.policy.data, .stdin)) continue;
+
                     return try .openStreamWithConfig(
                         context,
                         std.Io.File.stdin(),
@@ -591,18 +650,34 @@ pub fn FileCursor(mode: Mode) type {
                 };
                 switch (stat.kind) {
                     .directory, .sym_link => {
-                        if (self.recursive) {
-                            if (stat.kind == .sym_link and !self.followSymlink) {
+                        if (self.config.recursive) {
+                            if (stat.kind == .sym_link and !self.config.followSymlink) {
                                 @branchHint(.unlikely);
                                 return FileCursorError.FollowSymlinkDisabled;
                             }
-
                             maybeFile.close(context.io);
+
+                            if (!self.config.policy.interface.enter(self.config.policy.data, .{
+                                .preWalkerEntry = .{
+                                    .dir = cwd,
+                                    .basename = "",
+                                    .path = path,
+                                    .kind = stat.kind,
+                                    .inode = stat.inode,
+                                },
+                            })) continue;
 
                             const dir = try cwd.openDir(context.io, path, .{ .iterate = true });
                             errdefer dir.close(context.io);
 
-                            self.cursor = try rDir.walk(context.io, dir, path, context.allocator, self.followSymlink);
+                            self.cursor = try rDir.walk(
+                                context.io,
+                                dir,
+                                path,
+                                context.allocator,
+                                self.config.followSymlink,
+                                self.config.policy,
+                            );
 
                             continue :pathLoop;
                         } else {
@@ -611,6 +686,19 @@ pub fn FileCursor(mode: Mode) type {
                         }
                     },
                     else => {
+                        if (!self.config.policy.interface.open(self.config.policy.data, .{
+                            .preWalkerEntry = .{
+                                .dir = cwd,
+                                .basename = "",
+                                .path = path,
+                                .kind = stat.kind,
+                                .inode = stat.inode,
+                            },
+                        })) {
+                            maybeFile.close(context.io);
+                            continue;
+                        }
+
                         errdefer maybeFile.close(context.io);
                         return try .openStreamWithConfig(
                             context,

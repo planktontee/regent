@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const assert = std.debug.assert;
 const rlinux = @import("linux.zig");
+const rFs = @import("./fs.zig");
 
 pub const Iterator = struct {
     reader: Dir.Reader,
@@ -213,6 +214,7 @@ pub const SelectiveWalker = struct {
 
 pub const Walker = struct {
     inner: SelectiveWalker,
+    policy: rFs.FileCursorConfig.Policy,
 
     pub const Entry = struct {
         /// The containing directory. This can be used to operate directly on `basename`
@@ -243,10 +245,15 @@ pub const Walker = struct {
         switch (entry.kind) {
             .sym_link,
             .directory,
-            => try self.inner.enter(io, &entry),
+            => {
+                if (self.policy.interface.enter(self.policy.data, .{ .entry = entry })) {
+                    try self.inner.enter(io, &entry);
+                }
+            },
             else => {},
         }
 
+        if (!self.policy.interface.open(self.policy.data, .{ .entry = entry })) return error{Skipped}.Skipped;
         return entry;
     }
 
@@ -325,8 +332,17 @@ pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Alloc
 ///
 /// See also:
 /// * `walkSelectively`
-pub fn walk(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator, followSymlink: bool) !Walker {
-    return .{ .inner = try walkSelectively(io, dir, startPath, allocator, followSymlink) };
+pub fn walk(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator, followSymlink: bool, policy: rFs.FileCursorConfig.Policy) !Walker {
+    return .{
+        .inner = try walkSelectively(
+            io,
+            dir,
+            startPath,
+            allocator,
+            followSymlink,
+        ),
+        .policy = policy,
+    };
 }
 
 pub const statxRequest: linux.STATX = .{
