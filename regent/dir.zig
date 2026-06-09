@@ -477,7 +477,16 @@ test "dir walk test" {
     const thisDir = try cwd.openDir(io, ".", .{ .iterate = true });
     defer thisDir.close(io);
 
-    var w = try walk(io, thisDir, allocator);
+    var w = try walk(io, thisDir, ".", allocator, false, r: {
+        const p = rFs.FileCursorConfig.DefaultFileCursorPolicy{};
+        break :r .{
+            .data = @ptrCast(@constCast(&p)),
+            .interface = &.{
+                .open = &rFs.FileCursorConfig.DefaultFileCursorPolicy.open,
+                .enter = &rFs.FileCursorConfig.DefaultFileCursorPolicy.enter,
+            },
+        };
+    });
     defer w.deinit();
 
     var visited: std.AutoHashMapUnmanaged(SelectiveWalker.Visitor, void) = .empty;

@@ -51,6 +51,7 @@ pub fn strlenCapped(p: [*]const u8, cap: usize) CappedStrLenError!usize {
             if (@reduce(.Or, matches)) {
                 i += std.simd.firstTrue(matches).?;
                 if (i > cap) return error.StringTooLong;
+                return i;
             }
 
             i += @divExact(std.mem.alignForward(usize, start_addr, blockSize) - start_addr, @sizeOf(u8));
@@ -75,6 +76,7 @@ pub fn strlenCapped(p: [*]const u8, cap: usize) CappedStrLenError!usize {
             if (@reduce(.Or, matches)) {
                 i += std.simd.firstTrue(matches).?;
                 if (i > cap) return error.StringTooLong;
+                return i;
             }
             i += blockLen;
             if (i > cap) return error.StringTooLong;
