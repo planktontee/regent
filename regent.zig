@@ -11,6 +11,7 @@ pub const xstr = @import("regent/xstr.zig");
 pub const mem = @import("regent/mem.zig");
 pub const trampoline = @import("regent/trampoline.zig");
 pub const tagged = @import("regent/tagged.zig");
+pub const hash = @import("regent/hash.zig");
 
 comptime {
     _ = collections;
@@ -26,4 +27,5 @@ comptime {
     _ = mem;
     _ = trampoline;
     _ = tagged;
+    _ = hash;
 }

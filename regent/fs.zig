@@ -39,40 +39,41 @@ pub const BufferConfig = struct {
     charDeviceBuff: usize,
     unixSocketBuff: usize,
 
+    pub const defaultReaderConfig: BufferConfig = .{
+        .blockBufferSize = units.ByteUnit.mb,
+        .fileBufferSize = 256 * units.ByteUnit.kb,
+        .defaultPipeSize = 64 * units.ByteUnit.kb,
+        .maxPipeSize = units.ByteUnit.mb,
+        .charDeviceBuff = 1 * units.ByteUnit.kb,
+        .unixSocketBuff = 4 * units.ByteUnit.kb,
+    };
+
+    pub const defaultWriterConfig: BufferConfig = .{
+        .blockBufferSize = units.ByteUnit.mb,
+        .fileBufferSize = 256 * units.ByteUnit.kb,
+        .defaultPipeSize = 64 * units.ByteUnit.kb,
+        .maxPipeSize = units.ByteUnit.mb,
+        .charDeviceBuff = 4 * units.ByteUnit.kb,
+        .unixSocketBuff = 32 * units.ByteUnit.kb,
+    };
+
     pub fn initSame(size: usize) @This() {
+        const newSize = @max(1, size);
         return .{
-            .blockBufferSize = size,
-            .fileBufferSize = size,
-            .defaultPipeSize = size,
-            .maxPipeSize = size,
-            .charDeviceBuff = size,
-            .unixSocketBuff = size,
+            .blockBufferSize = newSize,
+            .fileBufferSize = newSize,
+            .defaultPipeSize = newSize,
+            .maxPipeSize = newSize,
+            .charDeviceBuff = newSize,
+            .unixSocketBuff = newSize,
         };
     }
 };
 
-const defaultReaderBufferConfig: BufferConfig = .{
-    .blockBufferSize = units.ByteUnit.mb,
-    .fileBufferSize = 256 * units.ByteUnit.kb,
-    .defaultPipeSize = 64 * units.ByteUnit.kb,
-    .maxPipeSize = units.ByteUnit.mb,
-    .charDeviceBuff = 1 * units.ByteUnit.kb,
-    .unixSocketBuff = 4 * units.ByteUnit.kb,
-};
-
-const defaultWriterBufferConfig: BufferConfig = .{
-    .blockBufferSize = units.ByteUnit.mb,
-    .fileBufferSize = 256 * units.ByteUnit.kb,
-    .defaultPipeSize = 64 * units.ByteUnit.kb,
-    .maxPipeSize = units.ByteUnit.mb,
-    .charDeviceBuff = 4 * units.ByteUnit.kb,
-    .unixSocketBuff = 32 * units.ByteUnit.kb,
-};
-
 pub fn defaultBufferConfig(mode: Mode) BufferConfig {
     return switch (mode) {
-        .read => defaultReaderBufferConfig,
-        .write => defaultWriterBufferConfig,
+        .read => .defaultReaderConfig,
+        .write => .defaultWriterConfig,
     };
 }
 
@@ -107,7 +108,7 @@ fn setODirect(io: Io, fd: std.os.linux.fd_t) rlinux.SetFdStatusFlagsError!void {
 
 fn alignODirectSize(size: usize) usize {
     const x = oDirectAlignment.toByteUnits() - 1;
-    return (size + x) & ~x;
+    return @max(1, (size + x) & ~x);
 }
 
 fn StreamT(comptime mode: Mode) type {
@@ -138,6 +139,14 @@ pub const OpenError = error{
     std.mem.Allocator.Error ||
     std.posix.MMapError;
 
+pub fn OpenResponse(mode: Mode) type {
+    return struct {
+        stat: std.Io.File.Stat,
+        stream: StreamT(mode),
+        alignment: std.mem.Alignment,
+    };
+}
+
 pub fn open(
     context: Context,
     path: []const u8,
@@ -146,11 +155,11 @@ pub fn open(
     openFileOptions: std.Io.Dir.OpenFileOptions,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
-) OpenError!struct { std.Io.File.Stat, StreamT(mode) } {
+) OpenError!OpenResponse(mode) {
     const file = try cwdOpen(context.io, path, openFileOptions);
     errdefer file.close(context.io);
 
-    return try openStream(
+    return openStream(
         context,
         file,
         mode,
@@ -171,7 +180,7 @@ pub fn openStream(
     openConfig: OpenConfig,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
-) OpenError!struct { std.Io.File.Stat, StreamT(mode) } {
+) OpenError!OpenResponse(mode) {
     const T = StreamT(mode);
     const openStreamingF: fn (File, std.Io, []u8) T = switch (mode) {
         .read => File.readerStreaming,
@@ -184,6 +193,7 @@ pub fn openStream(
 
     const oDirect = openConfig.oDirect;
     const stat = try file.stat(context.io);
+    const statSizeBuff: usize = @max(1, stat.size);
     switch (stat.kind) {
         .character_device,
         => {
@@ -192,12 +202,13 @@ pub fn openStream(
             // Absolutely nothing fancy to do here, char devices are incredibly simple
             // and this is tty oriented, this might be a giant waste for other char devices
             return .{
-                stat,
-                openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                .stat = stat,
+                .stream = openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                     u8,
                     bufferAlignment,
-                    @max(1, bufferConfig.charDeviceBuff),
+                    bufferConfig.charDeviceBuff,
                 )),
+                .alignment = bufferAlignment,
             };
         },
         .named_pipe,
@@ -213,12 +224,13 @@ pub fn openStream(
 
             // ODirect and types are ignored since pipes can only be read buffered
             return .{
-                stat,
-                openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                .stat = stat,
+                .stream = openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                     u8,
                     bufferAlignment,
-                    @max(1, pipeSize),
+                    pipeSize,
                 )),
+                .alignment = bufferAlignment,
             };
         },
         .unix_domain_socket,
@@ -226,12 +238,13 @@ pub fn openStream(
             if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
             // ODirect and types are ignored since pipes can only be read buffered
             return .{
-                stat,
-                openStreamingF(file, context.io, try context.allocator.alignedAlloc(
+                .stat = stat,
+                .stream = openStreamingF(file, context.io, try context.allocator.alignedAlloc(
                     u8,
                     bufferAlignment,
-                    @max(1, bufferConfig.unixSocketBuff),
+                    bufferConfig.unixSocketBuff,
                 )),
+                .alignment = bufferAlignment,
             };
         },
         .block_device,
@@ -244,14 +257,15 @@ pub fn openStream(
                 => {
                     if (oDirect) try setODirect(context.io, file.handle);
                     return .{
-                        stat,
-                        openF(file, context.io, try context.allocator.alignedAlloc(
+                        .stat = stat,
+                        .stream = openF(file, context.io, try context.allocator.alignedAlloc(
                             u8,
                             blockAlignment,
                             if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else r: {
-                                break :r @max(1, bufferConfig.blockBufferSize);
+                                break :r bufferConfig.blockBufferSize;
                             },
                         )),
+                        .alignment = blockAlignment,
                     };
                 },
                 .mmap => return OpenError.TBA,
@@ -264,22 +278,26 @@ pub fn openStream(
                 => {
                     if (oDirect) {
                         try setODirect(context.io, file.handle);
+                        const alignment = comptime resolveAlignment(true);
                         return .{
-                            stat,
-                            openF(file, context.io, try context.allocator.alignedAlloc(
+                            .stat = stat,
+                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
-                                resolveAlignment(true),
-                                alignODirectSize(@max(1, stat.size)),
+                                alignment,
+                                alignODirectSize(statSizeBuff),
                             )),
+                            .alignment = alignment,
                         };
                     } else {
+                        const alignment = comptime resolveAlignment(false);
                         return .{
-                            stat,
-                            openF(file, context.io, try context.allocator.alignedAlloc(
+                            .stat = stat,
+                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
-                                resolveAlignment(false),
-                                @max(1, stat.size),
+                                alignment,
+                                statSizeBuff,
                             )),
+                            .alignment = alignment,
                         };
                     }
                 },
@@ -287,22 +305,26 @@ pub fn openStream(
                 => {
                     if (oDirect) {
                         try setODirect(context.io, file.handle);
+                        const alignment = comptime resolveAlignment(true);
                         return .{
-                            stat,
-                            openF(file, context.io, try context.allocator.alignedAlloc(
+                            .stat = stat,
+                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
-                                resolveAlignment(true),
-                                alignODirectSize(@max(1, bufferConfig.fileBufferSize)),
+                                alignment,
+                                alignODirectSize(bufferConfig.fileBufferSize),
                             )),
+                            .alignment = alignment,
                         };
                     } else {
+                        const alignment = comptime resolveAlignment(false);
                         return .{
-                            stat,
-                            openF(file, context.io, try context.allocator.alignedAlloc(
+                            .stat = stat,
+                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
                                 u8,
-                                resolveAlignment(false),
-                                @max(1, bufferConfig.fileBufferSize),
+                                alignment,
+                                bufferConfig.fileBufferSize,
                             )),
+                            .alignment = alignment,
                         };
                     }
                 },
@@ -324,7 +346,11 @@ pub fn openStream(
                             stream.interface.end = stat.size;
                             stream.pos = stat.size;
                             stream.size = stat.size;
-                            return .{ stat, stream };
+                            return .{
+                                .stat = stat,
+                                .stream = stream,
+                                .alignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize()),
+                            };
                         },
                         .write => return error.TBA,
                     }
@@ -341,23 +367,12 @@ pub fn openStream(
     }
 }
 
-pub fn close(context: Context, bufferType: BufferType, fileStream: anytype) void {
-    fileStream.file.close(context.io);
-
-    switch (bufferType) {
-        .full,
-        .byte,
-        => context.allocator.free(fileStream.interface.buffer),
-        .mmap,
-        => std.posix.munmap(@alignCast(fileStream.interface.buffer)),
-    }
-}
-
 pub fn FileStream(mode: Mode) type {
     return struct {
         stream: StreamT(mode),
         stat: std.Io.File.Stat,
         bufferType: BufferType = DefaultBufferType,
+        alignment: std.mem.Alignment,
 
         pub const DefaultBufferType: BufferType = .byte;
 
@@ -366,7 +381,7 @@ pub fn FileStream(mode: Mode) type {
             path: []const u8,
         ) OpenError!@This() {
             const openConfig: OpenConfig = .{};
-            const stat, const stream = try rIO.open(
+            const r = try rIO.open(
                 context,
                 path,
                 mode,
@@ -376,9 +391,10 @@ pub fn FileStream(mode: Mode) type {
                 defaultBufferConfig(mode),
             );
             return .{
-                .stream = stream,
-                .stat = stat,
+                .stream = r.stream,
+                .stat = r.stat,
                 .bufferType = DefaultBufferType,
+                .alignment = r.alignment,
             };
         }
 
@@ -386,7 +402,7 @@ pub fn FileStream(mode: Mode) type {
             context: Context,
             file: File,
         ) OpenError!@This() {
-            const stat, const stream = try rIO.openStream(
+            const r = try rIO.openStream(
                 context,
                 file,
                 mode,
@@ -395,9 +411,10 @@ pub fn FileStream(mode: Mode) type {
                 defaultBufferConfig(mode),
             );
             return .{
-                .stream = stream,
-                .stat = stat,
+                .stream = r.stream,
+                .stat = r.stat,
                 .bufferType = DefaultBufferType,
+                .alignment = r.alignment,
             };
         }
 
@@ -410,7 +427,7 @@ pub fn FileStream(mode: Mode) type {
             bufferConfig: BufferConfig,
         ) OpenError!@This() {
             try openConfig.validate(mode, openFileOptions);
-            const stat, const stream = try rIO.open(
+            const r = try rIO.open(
                 context,
                 path,
                 mode,
@@ -420,9 +437,10 @@ pub fn FileStream(mode: Mode) type {
                 bufferConfig,
             );
             return .{
-                .stream = stream,
-                .stat = stat,
+                .stream = r.stream,
+                .stat = r.stat,
                 .bufferType = bufferType,
+                .alignment = r.alignment,
             };
         }
 
@@ -433,7 +451,7 @@ pub fn FileStream(mode: Mode) type {
             bufferType: BufferType,
             bufferConfig: BufferConfig,
         ) OpenError!@This() {
-            const stat, const stream = try rIO.openStream(
+            const r = try rIO.openStream(
                 context,
                 file,
                 mode,
@@ -442,9 +460,10 @@ pub fn FileStream(mode: Mode) type {
                 bufferConfig,
             );
             return .{
-                .stream = stream,
-                .stat = stat,
+                .stream = r.stream,
+                .stat = r.stat,
                 .bufferType = bufferType,
+                .alignment = r.alignment,
             };
         }
 
@@ -467,11 +486,27 @@ pub fn FileStream(mode: Mode) type {
         }
 
         pub fn close(self: @This(), context: Context) void {
-            rIO.close(
-                context,
-                self.bufferType,
-                self.stream,
-            );
+            self.stream.file.close(context.io);
+        }
+
+        pub fn deinit(self: *@This(), context: Context) void {
+            switch (self.bufferType) {
+                .full,
+                .byte,
+                => {
+                    const memory = self.stream.interface.buffer;
+                    const slice_info = @typeInfo(@TypeOf(memory)).pointer;
+                    comptime assert(slice_info.size == .slice);
+                    const bytes: []u8 = @ptrCast(@constCast(std.mem.absorbSentinel(memory)));
+                    if (bytes.len == 0) return;
+                    @memset(bytes, undefined);
+
+                    context.allocator.rawFree(memory, self.alignment, @returnAddress());
+                    self.stream.interface.buffer = undefined;
+                },
+                .mmap,
+                => std.posix.munmap(@alignCast(self.stream.interface.buffer)),
+            }
         }
     };
 }
