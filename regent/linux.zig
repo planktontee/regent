@@ -10,6 +10,13 @@ pub fn errnoBug(err: linux.E) Io.UnexpectedError {
     return error.Unexpected;
 }
 
+pub fn kernVersionOrAbove(comptime major: usize, comptime minor: usize, comptime patch: usize) bool {
+    const kern = builtin.os.version_range.linux.range.min;
+    if (kern.major != major) return kern.major > major;
+    if (kern.minor != minor) return kern.minor > minor;
+    return kern.patch >= patch;
+}
+
 pub const FcntlError = error{
     PermissionDenied,
     ResourceTemporarilyUnavailable,

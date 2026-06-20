@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Dir = Io.Dir;
 const File = Io.File;
@@ -289,7 +290,13 @@ pub fn walkSelectively(io: Io, dir: Dir, startPath: []const u8, allocator: Alloc
         io,
         dir.handle,
         "",
-        @bitCast(@as(u32, linux.AT.EMPTY_PATH | linux.AT.SYMLINK_FOLLOW)),
+        @bitCast(@as(
+            u32,
+            linux.AT.EMPTY_PATH | if (comptime rlinux.kernVersionOrAbove(6, 8, 0))
+                linux.AT.SYMLINK_FOLLOW
+            else
+                0,
+        )),
     );
     const buff: []align(std.heap.pageSize()) u8 = try allocator.alignedAlloc(
         u8,
@@ -345,17 +352,24 @@ pub fn walk(io: Io, dir: Dir, startPath: []const u8, allocator: Allocator, follo
     };
 }
 
-pub const statxRequest: linux.STATX = .{
-    .TYPE = true,
-    .MODE = true,
-    .ATIME = true,
-    .MTIME = true,
-    .CTIME = true,
-    .INO = true,
-    .SIZE = true,
-    .NLINK = true,
-    .BLOCKS = true,
-    .MNT_ID_UNIQUE = true,
+pub const statxRequest: linux.STATX = v: {
+    var r: linux.STATX = .{
+        .TYPE = true,
+        .MODE = true,
+        .ATIME = true,
+        .MTIME = true,
+        .CTIME = true,
+        .INO = true,
+        .SIZE = true,
+        .NLINK = true,
+        .BLOCKS = true,
+    };
+    if (rlinux.kernVersionOrAbove(6, 8, 0)) {
+        r.MNT_ID_UNIQUE = true;
+    } else {
+        r.MNT_ID = true;
+    }
+    break :v r;
 };
 
 pub const Stat = struct {
