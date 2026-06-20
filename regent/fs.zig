@@ -515,6 +515,49 @@ pub fn FileStream(mode: Mode) type {
             self.stream.interface.seek = 0;
         }
 
+        pub fn readLineRetained(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            // This is supposed to be a std.ArrayListAlignedUnmanaged, using anytype will
+            // allow for ducktyping of the alignment
+            resizeable: anytype,
+        ) !?[]const u8 {
+            const r: *std.Io.Reader = &self.stream.interface;
+            while (r.buffer.len > 0) {
+                // fill has to be called externally for .full because we want to avoid resizes
+                r.fill(1) catch |e| switch (e) {
+                    error.EndOfStream => return null,
+                    else => return e,
+                };
+
+                var buffered = r.buffered();
+                if (std.mem.findScalar(u8, buffered, '\n')) |idx| {
+                    r.buffer = buffered[idx + 1 ..];
+                    r.seek = 0;
+                    r.end = r.buffer.len;
+                    return buffered[0..idx];
+                } else {
+                    // This is only safe because we have a check for empty buffers
+                    if (self.bufferType == .full) {
+                        r.buffer = buffered[buffered.len..];
+                        r.seek = 0;
+                        r.end = 0;
+                        return buffered;
+                    }
+
+                    // Slide buffer forward, hiding what we already read
+                    const offset = resizeable.capacity - r.buffer.len;
+                    try resizeable.ensureTotalCapacity(allocator, r.buffer.len + r.buffer.len / 2);
+                    var newB = resizeable.items;
+                    newB.len = resizeable.capacity;
+                    r.buffer = newB[offset..];
+                    r.seek = 0;
+                    r.end = 0;
+                }
+            }
+            return null;
+        }
+
         pub fn close(self: @This(), context: Context) void {
             self.stream.file.close(context.io);
         }
@@ -635,6 +678,15 @@ pub fn FileCursor(mode: Mode) type {
                 context,
                 .{},
                 FileStream(mode).DefaultBufferType,
+                defaultBufferConfig(mode),
+            );
+        }
+
+        pub fn nextUnmanaged(self: *@This(), context: Context) !?FileStream(mode) {
+            return self.nextWithConfig(
+                context,
+                .{},
+                .unmanaged,
                 defaultBufferConfig(mode),
             );
         }
