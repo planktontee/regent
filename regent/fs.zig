@@ -17,6 +17,8 @@ pub const BufferType = enum {
     full,
     byte,
     mmap,
+    // Buffer responsability is entirely on the caller
+    unmanaged,
 };
 
 pub const Mode = enum {
@@ -25,8 +27,8 @@ pub const Mode = enum {
 };
 
 pub const bufferAlignment = std.mem.Alignment.fromByteUnits(std.simd.suggestVectorLengthForCpu(u8, builtin.cpu) orelse 8);
-const oDirectAlignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize());
-const blockAlignment = std.mem.Alignment.fromByteUnits(4 * units.ByteUnit.kb);
+pub const oDirectAlignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize());
+pub const blockAlignment = std.mem.Alignment.fromByteUnits(4 * units.ByteUnit.kb);
 fn resolveAlignment(comptime oDirect: bool) std.mem.Alignment {
     return if (oDirect) return oDirectAlignment else return bufferAlignment;
 }
@@ -66,6 +68,19 @@ pub const BufferConfig = struct {
             .maxPipeSize = newSize,
             .charDeviceBuff = newSize,
             .unixSocketBuff = newSize,
+        };
+    }
+
+    pub const GetError = error{UnsupportedFileType};
+
+    pub fn get(self: @This(), kind: std.Io.File.Kind) GetError!usize {
+        return switch (kind) {
+            .sym_link, .door, .directory, .event_port, .unknown, .whiteout => return error.UnsupportedFileType,
+            .named_pipe => self.defaultPipeSize,
+            .character_device => self.charDeviceBuff,
+            .block_device => self.blockBufferSize,
+            .unix_domain_socket => self.unixSocketBuff,
+            .file => self.fileBufferSize,
         };
     }
 };
@@ -133,6 +148,7 @@ pub const OpenError = error{
     MMapUsedInStreamingFd,
     TBA,
 } ||
+    BufferConfig.GetError ||
     rlinux.SetFdStatusFlagsError ||
     std.Io.File.StatError ||
     std.Io.File.OpenError ||
@@ -144,6 +160,7 @@ pub fn OpenResponse(mode: Mode) type {
         stat: std.Io.File.Stat,
         stream: StreamT(mode),
         alignment: std.mem.Alignment,
+        bufferType: BufferType,
     };
 }
 
@@ -155,6 +172,7 @@ pub fn open(
     openFileOptions: std.Io.Dir.OpenFileOptions,
     bufferType: BufferType,
     bufferConfig: BufferConfig,
+    stat: ?std.Io.File.Stat,
 ) OpenError!OpenResponse(mode) {
     const file = try cwdOpen(context.io, path, openFileOptions);
     errdefer file.close(context.io);
@@ -166,7 +184,30 @@ pub fn open(
         openConfig,
         bufferType,
         bufferConfig,
+        stat,
     );
+}
+
+inline fn innerOpen(
+    comptime mode: Mode,
+    openF: fn (File, std.Io, []u8) StreamT(mode),
+    context: Context,
+    stat: std.Io.File.Stat,
+    file: std.Io.File,
+    comptime alignment: std.mem.Alignment,
+    buffSize: usize,
+    bufferType: BufferType,
+) OpenError!OpenResponse(mode) {
+    return .{
+        .stat = stat,
+        .stream = openF(file, context.io, try context.allocator.alignedAlloc(
+            u8,
+            alignment,
+            buffSize,
+        )),
+        .alignment = bufferAlignment,
+        .bufferType = bufferType,
+    };
 }
 
 // Im gonna have to find a way to move Stat out of this method
@@ -178,192 +219,166 @@ pub fn openStream(
     file: File,
     comptime mode: Mode,
     openConfig: OpenConfig,
-    bufferType: BufferType,
+    argBufferType: BufferType,
     bufferConfig: BufferConfig,
+    optStat: ?std.Io.File.Stat,
 ) OpenError!OpenResponse(mode) {
+    var bufferType = argBufferType;
+
     const T = StreamT(mode);
     const openStreamingF: fn (File, std.Io, []u8) T = switch (mode) {
         .read => File.readerStreaming,
         .write => File.writerStreaming,
     };
-    const openF: fn (File, std.Io, []u8) T = switch (mode) {
+    const openPositionalF: fn (File, std.Io, []u8) T = switch (mode) {
         .read => File.reader,
         .write => File.writer,
     };
 
     const oDirect = openConfig.oDirect;
-    const stat = try file.stat(context.io);
-    const statSizeBuff: usize = @max(1, stat.size);
-    switch (stat.kind) {
-        .character_device,
-        => {
-            if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
+    const stat = if (optStat) |stt| stt else try file.stat(context.io);
 
-            // Absolutely nothing fancy to do here, char devices are incredibly simple
-            // and this is tty oriented, this might be a giant waste for other char devices
-            return .{
-                .stat = stat,
-                .stream = openStreamingF(file, context.io, try context.allocator.alignedAlloc(
-                    u8,
-                    bufferAlignment,
-                    bufferConfig.charDeviceBuff,
-                )),
-                .alignment = bufferAlignment,
-            };
-        },
-        .named_pipe,
-        => {
-            if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
+    typeLoop: switch (bufferType) {
+        .byte => switch (stat.kind) {
+            .character_device, .unix_domain_socket => return try innerOpen(
+                mode,
+                openStreamingF,
+                context,
+                stat,
+                file,
+                bufferAlignment,
+                try bufferConfig.get(stat.kind),
+                bufferType,
+            ),
+            .named_pipe => {
+                var pipeSize = bufferConfig.defaultPipeSize;
+                if (openConfig.expandPipe) {
+                    // Attempt to set pipesize to 1mb, this is best effort
+                    if (expandPipeSize(context.io, file.handle, bufferConfig.maxPipeSize))
+                        pipeSize = bufferConfig.maxPipeSize;
+                }
 
-            var pipeSize: usize = bufferConfig.defaultPipeSize;
-            if (openConfig.expandPipe) {
-                // Attempt to set pipesize to 1mb, this is best effort
-                if (expandPipeSize(context.io, file.handle, bufferConfig.maxPipeSize))
-                    pipeSize = bufferConfig.maxPipeSize;
-            }
-
-            // ODirect and types are ignored since pipes can only be read buffered
-            return .{
-                .stat = stat,
-                .stream = openStreamingF(file, context.io, try context.allocator.alignedAlloc(
-                    u8,
+                // ODirect and types are ignored since pipes can only be read buffered
+                return try innerOpen(
+                    mode,
+                    openStreamingF,
+                    context,
+                    stat,
+                    file,
                     bufferAlignment,
                     pipeSize,
-                )),
-                .alignment = bufferAlignment,
-            };
+                    bufferType,
+                );
+            },
+            .block_device => {
+                if (oDirect) try setODirect(context.io, file.handle);
+                return try innerOpen(
+                    mode,
+                    openPositionalF,
+                    context,
+                    stat,
+                    file,
+                    blockAlignment,
+                    if (oDirect)
+                        alignODirectSize(bufferConfig.blockBufferSize)
+                    else
+                        bufferConfig.blockBufferSize,
+                    bufferType,
+                );
+            },
+            .file => inline for (0..2) |cBoolResolver| {
+                if ((cBoolResolver == 1) == oDirect) {
+                    const cODirect = cBoolResolver == 1;
+                    if (cODirect) try setODirect(context.io, file.handle);
+
+                    const bufferSize = if (cODirect)
+                        alignODirectSize(bufferConfig.fileBufferSize)
+                    else
+                        bufferConfig.fileBufferSize;
+                    return try innerOpen(
+                        mode,
+                        openPositionalF,
+                        context,
+                        stat,
+                        file,
+                        resolveAlignment(cODirect),
+                        bufferSize,
+                        bufferType,
+                    );
+                }
+            } else unreachable,
+            else => unreachable,
         },
-        .unix_domain_socket,
-        => {
-            if (bufferType == .mmap) return error.MMapUsedInStreamingFd;
-            // ODirect and types are ignored since pipes can only be read buffered
-            return .{
-                .stat = stat,
-                .stream = openStreamingF(file, context.io, try context.allocator.alignedAlloc(
-                    u8,
-                    bufferAlignment,
-                    bufferConfig.unixSocketBuff,
-                )),
-                .alignment = bufferAlignment,
-            };
+        .full => switch (stat.kind) {
+            .character_device, .unix_domain_socket, .named_pipe => {
+                bufferType = .byte;
+                continue :typeLoop bufferType;
+            },
+            .block_device => return error.TBA,
+            .file => inline for (0..2) |cBoolResolver| {
+                if ((cBoolResolver == 1) == oDirect) {
+                    const cODirect = cBoolResolver == 1;
+                    if (cODirect) try setODirect(context.io, file.handle);
+
+                    const statSizeBuff: usize = @max(1, stat.size);
+                    const bufferSize = if (cODirect)
+                        alignODirectSize(statSizeBuff)
+                    else
+                        statSizeBuff;
+                    return try innerOpen(
+                        mode,
+                        openPositionalF,
+                        context,
+                        stat,
+                        file,
+                        resolveAlignment(cODirect),
+                        bufferSize,
+                        bufferType,
+                    );
+                }
+            } else unreachable,
+            else => unreachable,
         },
-        .block_device,
-        => {
-            switch (bufferType) {
-                // Block devices dont return size on stat, so they have to be queried some other way
-                // mmap and direct works
-                .full => return OpenError.TBA,
-                .byte,
-                => {
-                    if (oDirect) try setODirect(context.io, file.handle);
+        .mmap => switch (stat.kind) {
+            .character_device, .unix_domain_socket, .named_pipe => return error.MMapUsedInStreamingFd,
+            .block_device => return error.TBA,
+            .file => switch (mode) {
+                .read => {
+                    const ptr = try std.posix.mmap(
+                        null,
+                        // MMAP fails with 0, so min has to 1
+                        @max(@as(usize, @intCast(stat.size)), 1),
+                        .{ .READ = true },
+                        .{ .TYPE = .PRIVATE },
+                        file.handle,
+                        0,
+                    );
+
+                    var stream = openPositionalF(file, context.io, ptr);
+                    stream.interface.end = stat.size;
+                    stream.pos = stat.size;
+                    stream.size = stat.size;
                     return .{
                         .stat = stat,
-                        .stream = openF(file, context.io, try context.allocator.alignedAlloc(
-                            u8,
-                            blockAlignment,
-                            if (oDirect) alignODirectSize(bufferConfig.blockBufferSize) else r: {
-                                break :r bufferConfig.blockBufferSize;
-                            },
-                        )),
-                        .alignment = blockAlignment,
+                        .stream = stream,
+                        .alignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize()),
+                        .bufferType = bufferType,
                     };
                 },
-                .mmap => return OpenError.TBA,
-            }
+                .write => return error.TBA,
+            },
+            else => unreachable,
         },
-        .file,
-        => {
-            switch (bufferType) {
-                .full,
-                => {
-                    if (oDirect) {
-                        try setODirect(context.io, file.handle);
-                        const alignment = comptime resolveAlignment(true);
-                        return .{
-                            .stat = stat,
-                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
-                                u8,
-                                alignment,
-                                alignODirectSize(statSizeBuff),
-                            )),
-                            .alignment = alignment,
-                        };
-                    } else {
-                        const alignment = comptime resolveAlignment(false);
-                        return .{
-                            .stat = stat,
-                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
-                                u8,
-                                alignment,
-                                statSizeBuff,
-                            )),
-                            .alignment = alignment,
-                        };
-                    }
-                },
-                .byte,
-                => {
-                    if (oDirect) {
-                        try setODirect(context.io, file.handle);
-                        const alignment = comptime resolveAlignment(true);
-                        return .{
-                            .stat = stat,
-                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
-                                u8,
-                                alignment,
-                                alignODirectSize(bufferConfig.fileBufferSize),
-                            )),
-                            .alignment = alignment,
-                        };
-                    } else {
-                        const alignment = comptime resolveAlignment(false);
-                        return .{
-                            .stat = stat,
-                            .stream = openF(file, context.io, try context.allocator.alignedAlloc(
-                                u8,
-                                alignment,
-                                bufferConfig.fileBufferSize,
-                            )),
-                            .alignment = alignment,
-                        };
-                    }
-                },
-                .mmap,
-                => {
-                    switch (mode) {
-                        .read => {
-                            const ptr = try std.posix.mmap(
-                                null,
-                                // MMAP fails with 0, so min has to 1
-                                @max(@as(usize, @intCast(stat.size)), 1),
-                                .{ .READ = true },
-                                .{ .TYPE = .PRIVATE },
-                                file.handle,
-                                0,
-                            );
-
-                            var stream = openF(file, context.io, ptr);
-                            stream.interface.end = stat.size;
-                            stream.pos = stat.size;
-                            stream.size = stat.size;
-                            return .{
-                                .stat = stat,
-                                .stream = stream,
-                                .alignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize()),
-                            };
-                        },
-                        .write => return error.TBA,
-                    }
-                },
-            }
+        .unmanaged => return .{
+            .stat = stat,
+            .stream = switch (stat.kind) {
+                .character_device, .unix_domain_socket, .named_pipe => openStreamingF(file, context.io, &.{}),
+                .block_device, .file => openPositionalF(file, context.io, &.{}),
+                else => unreachable,
+            },
+            .alignment = bufferAlignment,
+            .bufferType = bufferType,
         },
-        .sym_link,
-        .door,
-        .directory,
-        .event_port,
-        .unknown,
-        .whiteout,
-        => return OpenError.FileCannotBeOpenedForRead,
     }
 }
 
@@ -371,7 +386,9 @@ pub fn FileStream(mode: Mode) type {
     return struct {
         stream: StreamT(mode),
         stat: std.Io.File.Stat,
-        bufferType: BufferType = DefaultBufferType,
+        bufferType: BufferType,
+        // if bufferType is .unmanaged, this is merely a suggestion
+        // user is responsible for filling the correct value before calling deinit
         alignment: std.mem.Alignment,
 
         pub const DefaultBufferType: BufferType = .byte;
@@ -389,11 +406,12 @@ pub fn FileStream(mode: Mode) type {
                 openConfig.toOpenFileOptions(mode),
                 DefaultBufferType,
                 defaultBufferConfig(mode),
+                null,
             );
             return .{
                 .stream = r.stream,
                 .stat = r.stat,
-                .bufferType = DefaultBufferType,
+                .bufferType = r.bufferType,
                 .alignment = r.alignment,
             };
         }
@@ -409,11 +427,12 @@ pub fn FileStream(mode: Mode) type {
                 .{},
                 DefaultBufferType,
                 defaultBufferConfig(mode),
+                null,
             );
             return .{
                 .stream = r.stream,
                 .stat = r.stat,
-                .bufferType = DefaultBufferType,
+                .bufferType = r.bufferType,
                 .alignment = r.alignment,
             };
         }
@@ -425,6 +444,7 @@ pub fn FileStream(mode: Mode) type {
             openFileOptions: std.Io.Dir.OpenFileOptions,
             bufferType: BufferType,
             bufferConfig: BufferConfig,
+            stat: ?std.Io.File.Stat,
         ) OpenError!@This() {
             try openConfig.validate(mode, openFileOptions);
             const r = try rIO.open(
@@ -435,11 +455,12 @@ pub fn FileStream(mode: Mode) type {
                 openFileOptions,
                 bufferType,
                 bufferConfig,
+                stat,
             );
             return .{
                 .stream = r.stream,
                 .stat = r.stat,
-                .bufferType = bufferType,
+                .bufferType = r.bufferType,
                 .alignment = r.alignment,
             };
         }
@@ -450,6 +471,7 @@ pub fn FileStream(mode: Mode) type {
             openConfig: OpenConfig,
             bufferType: BufferType,
             bufferConfig: BufferConfig,
+            stat: ?std.Io.File.Stat,
         ) OpenError!@This() {
             const r = try rIO.openStream(
                 context,
@@ -458,11 +480,12 @@ pub fn FileStream(mode: Mode) type {
                 openConfig,
                 bufferType,
                 bufferConfig,
+                stat,
             );
             return .{
                 .stream = r.stream,
                 .stat = r.stat,
-                .bufferType = bufferType,
+                .bufferType = r.bufferType,
                 .alignment = r.alignment,
             };
         }
@@ -485,15 +508,20 @@ pub fn FileStream(mode: Mode) type {
             }
         }
 
+        pub fn setBuffer(self: *@This(), comptime alignment: std.mem.Alignment, buffer: []u8) void {
+            self.alignment = alignment;
+            self.stream.interface.buffer = buffer;
+            self.stream.interface.end = 0;
+            self.stream.interface.seek = 0;
+        }
+
         pub fn close(self: @This(), context: Context) void {
             self.stream.file.close(context.io);
         }
 
         pub fn deinit(self: *@This(), context: Context) void {
             switch (self.bufferType) {
-                .full,
-                .byte,
-                => {
+                .full, .byte, .unmanaged => {
                     const memory = self.stream.interface.buffer;
                     const slice_info = @typeInfo(@TypeOf(memory)).pointer;
                     comptime assert(slice_info.size == .slice);
@@ -504,8 +532,7 @@ pub fn FileStream(mode: Mode) type {
                     context.allocator.rawFree(memory, self.alignment, @returnAddress());
                     self.stream.interface.buffer = undefined;
                 },
-                .mmap,
-                => std.posix.munmap(@alignCast(self.stream.interface.buffer)),
+                .mmap => std.posix.munmap(@alignCast(self.stream.interface.buffer)),
             }
         }
     };
@@ -647,6 +674,7 @@ pub fn FileCursor(mode: Mode) type {
                                         openConfig,
                                         bufferType,
                                         bufferConfig,
+                                        null,
                                     );
                                 },
                             }
@@ -674,6 +702,7 @@ pub fn FileCursor(mode: Mode) type {
                         openConfig,
                         bufferType,
                         bufferConfig,
+                        null,
                     );
                 }
 
@@ -741,6 +770,7 @@ pub fn FileCursor(mode: Mode) type {
                             openConfig,
                             bufferType,
                             bufferConfig,
+                            stat,
                         );
                     },
                 }

@@ -7,8 +7,8 @@ pub fn stackTrampoline(
     R: type,
     // The lower the less code gen is created
     StackSizeType: type,
-    init: std.process.Init.Minimal,
-    callback: fn (std.process.Init.Minimal, ?Allocator) R,
+    init: anytype,
+    callback: fn (@TypeOf(init), ?Allocator) R,
     comptime reservedInMibs: usize,
 ) R {
     const StackSizeTInfo = @typeInfo(StackSizeType);
@@ -42,9 +42,9 @@ pub fn stackTrampoline(
 // This is needed to avoid stack allocations unless called
 fn innerStackTrampoline(
     R: type,
-    init: std.process.Init.Minimal,
+    init: anytype,
     comptime allocize: usize,
-    callback: fn (std.process.Init.Minimal, ?Allocator) R,
+    callback: fn (@TypeOf(init), ?Allocator) R,
 ) R {
     var buffer: [allocize]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buffer);
