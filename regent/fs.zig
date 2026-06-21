@@ -523,21 +523,23 @@ pub fn FileStream(mode: Mode) type {
             resizeable: anytype,
         ) !?[]const u8 {
             const r: *std.Io.Reader = &self.stream.interface;
+            var fillTarget: usize = 1;
             while (r.buffer.len > 0) {
-                // fill has to be called externally for .full because we want to avoid resizes
-                r.fill(1) catch |e| switch (e) {
+                r.fill(fillTarget) catch |e| switch (e) {
                     error.EndOfStream => return null,
                     else => return e,
                 };
 
                 var buffered = r.buffered();
                 if (std.mem.findScalar(u8, buffered, '\n')) |idx| {
-                    r.buffer = buffered[idx + 1 ..];
+                    fillTarget = 1;
+                    r.buffer = r.buffer[idx + 1 ..];
                     r.seek = 0;
-                    r.end = r.buffer.len;
+                    r.end = buffered.len - idx - 1;
                     return buffered[0..idx];
                 } else {
                     // This is only safe because we have a check for empty buffers
+                    // everything else in the buffer is the last line
                     if (self.bufferType == .full) {
                         r.buffer = buffered[buffered.len..];
                         r.seek = 0;
@@ -545,14 +547,29 @@ pub fn FileStream(mode: Mode) type {
                         return buffered;
                     }
 
-                    // Slide buffer forward, hiding what we already read
-                    const offset = resizeable.capacity - r.buffer.len;
-                    try resizeable.ensureTotalCapacity(allocator, r.buffer.len + r.buffer.len / 2);
-                    var newB = resizeable.items;
-                    newB.len = resizeable.capacity;
-                    r.buffer = newB[offset..];
+                    // We could've buffered more but the underlaying Reader didnt buffer
+                    // more data, which means it's done and we should wrap up with whatever was buffered
+                    if (r.end < r.buffer.len) {
+                        r.buffer = r.buffer[r.buffer.len..];
+                        r.seek = 0;
+                        r.end = 0;
+                        return buffered;
+                    }
+
+                    // tail end matches capacity, the only parts that are missing are the 'beginning'
+                    // which have been sliced off as part of the delimiter search hits, now we need to
+                    // read more things, which means we need to preserve what was buffered and request more
+                    // bufferStartOffset represents where r.buffer started considered the original buffer
+                    const bufferStartOffset = resizeable.capacity - r.buffer.len;
+                    // This is the remainder, that may or may not be finished
+                    const oldEnd = r.buffer.len;
+
+                    try resizeable.ensureTotalCapacity(allocator, resizeable.capacity + resizeable.capacity / 2);
+                    r.buffer = resizeable.allocatedSlice()[bufferStartOffset..];
                     r.seek = 0;
-                    r.end = 0;
+
+                    // next fill will ask for buffered + 1 to force a read
+                    fillTarget = oldEnd + 1;
                 }
             }
             return null;
