@@ -135,17 +135,20 @@ pub const SelectiveWalker = struct {
                 ) catch return;
 
                 // update inode to target inode for symlinks
+                if (self.visitor.contains(.{ statx.mount_id, statx.inode })) return EnterError.EntryAlreadyVisited;
+
                 entry.inode = statx.inode;
-                if (self.visitor.contains(.{ statx.mount_id, entry.inode })) return EnterError.EntryAlreadyVisited;
+                entry.kind = statx.kind;
 
                 switch (statx.kind) {
                     .directory => {
                         try self.innerEnter(io, entry.*);
                         self.stack.items[self.stack.items.len - 1].iter.mountId = statx.mount_id;
-                        try self.visitor.put(self.allocator, .{ statx.mount_id, entry.inode }, {});
                     },
                     else => {},
                 }
+
+                try self.visitor.put(self.allocator, .{ statx.mount_id, statx.inode }, {});
             },
             else => {
                 @branchHint(.cold);

@@ -564,6 +564,9 @@ pub fn FileStream(mode: Mode) type {
                     // This is the remainder, that may or may not be finished
                     const oldEnd = r.buffer.len;
 
+                    // Internally ensureTotalCapacity wont expand or use past items.len for resize/remap, so we need
+                    // this in order to retain because we arent fiddling with this buffer from inside the arraylist
+                    resizeable.expandToCapacity();
                     try resizeable.ensureTotalCapacity(allocator, resizeable.capacity + resizeable.capacity / 2);
                     r.buffer = resizeable.allocatedSlice()[bufferStartOffset..];
                     r.seek = 0;
