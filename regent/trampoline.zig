@@ -4,51 +4,59 @@ const units = @import("./units.zig");
 
 // After calling trampoline, DO NOT return anything past this point that has been allocated from the stack allocator
 pub fn stackTrampoline(
-    R: type,
     // The lower the less code gen is created
     StackSizeType: type,
-    init: anytype,
-    callback: fn (@TypeOf(init), ?Allocator) R,
     comptime reservedInMibs: usize,
-) R {
+    f: anytype,
+    args: @typeInfo(@TypeOf(f)).@"fn".params[0].type.?,
+) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    if (@typeInfo(@TypeOf(args)).@"struct".fields[0].type != ?std.mem.Allocator)
+        @compileError("First arg of stackTrampoline(..., f, ...) has to be ?std.mem.Allocator");
+
     const StackSizeTInfo = @typeInfo(StackSizeType);
     if (@typeInfo(StackSizeType) != .int or StackSizeTInfo.int.signedness == .signed) @compileError("StackSizeType must be a uX type");
 
-    const rlimit = std.posix.getrlimit(.STACK) catch return callback(init, null);
+    const rlimit = std.posix.getrlimit(.STACK) catch {
+        var a = args;
+        a.@"0" = null;
+        return f(a);
+    };
     const currMib = rlimit.cur / units.ByteUnit.mb;
     const targetMaxT = std.math.maxInt(StackSizeType);
 
     if (currMib <= targetMaxT and currMib > 5) {
         switch (@as(StackSizeType, @intCast(currMib))) {
             inline else => |targetMib| {
-                if (targetMib <= reservedInMibs) return callback(init, null);
+                if (targetMib <= reservedInMibs) {
+                    var a = args;
+                    a.@"0" = null;
+                    return f(a);
+                }
 
                 const target: usize = @intCast(targetMib - reservedInMibs);
                 const targetInMib = target * units.ByteUnit.mb;
 
-                return innerStackTrampoline(
-                    R,
-                    init,
-                    targetInMib,
-                    callback,
-                );
+                return innerStackTrampoline(targetInMib, f, args);
             },
         }
     }
 
-    return callback(init, null);
+    var a = args;
+    a.@"0" = null;
+    return f(a);
 }
 
 // This is needed to avoid stack allocations unless called
 fn innerStackTrampoline(
-    R: type,
-    init: anytype,
-    comptime allocize: usize,
-    callback: fn (@TypeOf(init), ?Allocator) R,
-) R {
-    var buffer: [allocize]u8 = undefined;
+    comptime allocSize: usize,
+    f: anytype,
+    args: @typeInfo(@TypeOf(f)).@"fn".params[0].type.?,
+) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    var buffer: [allocSize]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buffer);
-    const allocator = fba.allocator();
+    var a = args;
 
-    return callback(init, allocator);
+    // TODO: figure out if we need the threadSafe version
+    a.@"0" = fba.allocator();
+    return f(a);
 }
