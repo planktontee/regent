@@ -515,6 +515,27 @@ pub fn FileStream(mode: Mode) type {
             self.stream.interface.seek = 0;
         }
 
+        pub fn setMmapBuffer(self: *@This()) OpenError!void {
+            if (self.stat.kind != .file) return error.MMapUsedInStreamingFd;
+
+            const ptr = try std.posix.mmap(
+                null,
+                // MMAP fails with 0, so min has to 1
+                @max(@as(usize, @intCast(self.stat.size)), 1),
+                .{ .READ = true },
+                .{ .TYPE = .PRIVATE },
+                self.stream.file.handle,
+                0,
+            );
+
+            self.stream.interface.buffer = ptr;
+            self.stream.interface.end = self.stat.size;
+            self.stream.pos = self.stat.size;
+            self.stream.size = self.stat.size;
+            self.bufferType = .mmap;
+            self.alignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize());
+        }
+
         pub fn readLineRetained(
             self: *@This(),
             allocator: std.mem.Allocator,
