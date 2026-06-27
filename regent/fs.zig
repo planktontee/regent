@@ -53,8 +53,9 @@ pub const BufferConfig = struct {
     pub const defaultWriterConfig: BufferConfig = .{
         .blockBufferSize = units.ByteUnit.mb,
         .fileBufferSize = 256 * units.ByteUnit.kb,
+        // We could expand the pipe here, but I'm getting some issues related to it
         .defaultPipeSize = 64 * units.ByteUnit.kb,
-        .maxPipeSize = units.ByteUnit.mb,
+        .maxPipeSize = 64 * units.ByteUnit.kb,
         .charDeviceBuff = 4 * units.ByteUnit.kb,
         .unixSocketBuff = 32 * units.ByteUnit.kb,
     };
@@ -741,6 +742,10 @@ pub fn FileCursor(mode: Mode) type {
             return if (self.hasTrailingPath) path[0 .. path.len - 1] else path;
         }
 
+        // TODO: inherit visitor for newer walkers to keep track of symlinks
+        // NOTE: when mulitple paths are given and one is on top of the other, even with the fix above
+        // nextWithConfig will evalue the same files again, I dont know if I care about it tbh, the cost
+        // to fix this case is big
         pub fn nextWithConfig(
             self: *@This(),
             context: Context,
@@ -751,7 +756,13 @@ pub fn FileCursor(mode: Mode) type {
             pathLoop: while (true) {
                 if (self.cursor) |*cursor| {
                     while (true) {
-                        if (cursor.next(context.io) catch continue) |entry| {
+                        if (cursor.next(context.io) catch |e| {
+                            switch (e) {
+                                // Review all errors for better propagation picks
+                                error.OutOfMemory => return e,
+                                else => continue,
+                            }
+                        }) |entry| {
                             switch (entry.kind) {
                                 .sym_link, .directory => continue,
                                 else => {
@@ -780,7 +791,10 @@ pub fn FileCursor(mode: Mode) type {
                     }
                 }
 
-                const path = try self.pickPath() orelse return null;
+                const path = try self.pickPath() orelse {
+                    self.i += 1;
+                    return null;
+                };
                 // In all cases, even if there's an error, we move to i += 1
                 // the only case where we dont do that is when we are running the cursor loop at the beginning
                 // This means any failure we move forward already
