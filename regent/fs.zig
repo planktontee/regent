@@ -893,3 +893,132 @@ pub fn FileCursor(mode: Mode) type {
         }
     };
 }
+
+pub const Utf8Cursor = struct {
+    reader: *std.Io.Reader,
+
+    pub const NextError = error{
+        BadUtf8,
+    };
+
+    pub fn next(self: *@This()) !?u21 {
+        const r = self.reader;
+
+        if (r.buffered().len == 0) {
+            r.fill(1) catch |e| switch (e) {
+                error.EndOfStream => return null,
+                error.ReadFailed => return e,
+            };
+        }
+
+        const buf = r.buffered();
+        const lead = buf[0];
+
+        const len = std.unicode.utf8ByteSequenceLength(lead) catch {
+            r.toss(1);
+            return error.BadUtf8;
+        };
+
+        if (len == 1) {
+            r.toss(1);
+            return @intCast(lead);
+        }
+
+        var seq: [4]u8 = undefined;
+        seq[0] = lead;
+        r.toss(1);
+
+        for (1..len) |i| {
+            if (r.bufferedLen() == 0) {
+                r.fill(1) catch |e| switch (e) {
+                    error.EndOfStream => return error.BadUtf8,
+                    error.ReadFailed => return e,
+                };
+            }
+
+            seq[i] = r.buffered()[0];
+            r.toss(1);
+        }
+
+        const codepoint = std.unicode.utf8Decode(seq[0..len]) catch {
+            return error.BadUtf8;
+        };
+
+        return codepoint;
+    }
+};
+
+test "utf8 cursor" {
+    const testing = std.testing;
+    var reader: std.Io.Reader = .fixed(@as([]const u8, ([_]u8{
+        'A',
+        0x7F,
+        0x80,
+        // 2b
+        0xC2,
+        0x80,
+        // -
+        0xDF,
+        0xBF,
+        // failures
+        0xC0,
+        0xAF,
+        // -
+        0xC0,
+        0x80,
+        // 3b
+        0xE0,
+        0xA0,
+        0x80,
+        // -
+        0xED,
+        0x9F,
+        0xBF,
+        // -
+        0xEE,
+        0x80,
+        0x80,
+        // failures
+        0xE0,
+        0x9F,
+        0xBF,
+        // 4b
+        0xF0,
+        0x90,
+        0x80,
+        0x80,
+        // -
+        0xF4,
+        0x8F,
+        0xBF,
+        0xBF,
+        // -
+        0xF0,
+        0x9F,
+        0x92,
+        0xA9,
+        // failures
+        0xF0,
+        0x8F,
+        0xBF,
+        0xBF,
+    })[0..]));
+    var cursor: Utf8Cursor = .{ .reader = &reader };
+
+    try testing.expectEqual('A', try cursor.next());
+    try testing.expectEqual(0x7F, try cursor.next());
+    try testing.expectError(error.BadUtf8, cursor.next());
+    try testing.expectEqual(0x80, cursor.next());
+    try testing.expectEqual(0x07FF, cursor.next());
+    try testing.expectError(error.BadUtf8, cursor.next());
+    try testing.expectError(error.BadUtf8, cursor.next());
+    try testing.expectEqual(0x0800, cursor.next());
+    try testing.expectEqual(0xD7FF, cursor.next());
+    try testing.expectEqual(0xE000, cursor.next());
+    try testing.expectError(error.BadUtf8, cursor.next());
+    try testing.expectEqual(0x010000, cursor.next());
+    try testing.expectEqual(0x10FFFF, cursor.next());
+    try testing.expectEqual('💩', cursor.next());
+    try testing.expectError(error.BadUtf8, cursor.next());
+    try testing.expectEqual(null, cursor.next());
+}
