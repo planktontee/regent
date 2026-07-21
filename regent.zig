@@ -12,20 +12,9 @@ pub const mem = @import("regent/mem.zig");
 pub const trampoline = @import("regent/trampoline.zig");
 pub const tagged = @import("regent/tagged.zig");
 pub const hash = @import("regent/hash.zig");
+pub const str = @import("regent/str.zig");
 
 comptime {
-    _ = collections;
-    _ = meta;
-    _ = units;
-    _ = result;
-    _ = testing;
-    _ = ergo;
-    _ = fs;
-    _ = dir;
-    _ = linux;
-    _ = xstr;
-    _ = mem;
-    _ = trampoline;
-    _ = tagged;
-    _ = hash;
+    const std = @import("std");
+    std.testing.refAllDecls(@This());
 }

@@ -600,6 +600,34 @@ pub fn FileStream(mode: Mode) type {
             return null;
         }
 
+        pub fn readFileRetained(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            // This is supposed to be a std.ArrayListAlignedUnmanaged, using anytype will
+            // allow for ducktyping of the alignment
+            resizeable: anytype,
+        ) ![]const u8 {
+            const r: *std.Io.Reader = &self.stream.interface;
+            // This ensures .full ends up in EndOfStream right away
+            var fillTarget: usize = r.buffer.len;
+            while (true) {
+                r.fill(fillTarget) catch |e| switch (e) {
+                    error.EndOfStream => return r.buffered(),
+                    else => return e,
+                };
+
+                // Internally ensureTotalCapacity wont expand or use past items.len for resize/remap, so we need
+                // this in order to retain because we arent fiddling with this buffer from inside the arraylist
+                resizeable.expandToCapacity();
+                try resizeable.ensureTotalCapacity(allocator, resizeable.capacity + resizeable.capacity / 2);
+                r.buffer = resizeable.allocatedSlice();
+
+                // next fill will ask for new buff.len + 1 to shoot for EndOfStream
+                fillTarget = r.buffer.len;
+            }
+            unreachable;
+        }
+
         pub fn close(self: @This(), context: Context) void {
             self.stream.file.close(context.io);
         }
