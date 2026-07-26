@@ -228,6 +228,12 @@ pub fn ReverseTokenIterator(comptime T: type, comptime delimiter_type: std.mem.D
     };
 }
 
+pub const BPlusTree = @import("collections/bplustree.zig").BPlusTree;
+
+comptime {
+    _ = std.testing.refAllDecls(@This());
+}
+
 test "reverse tokenizer" {
     const t = std.testing;
     const s: []const u8 = "conf.type.text.banana";

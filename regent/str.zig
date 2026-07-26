@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn isNumber(s: []const u8) bool {
+pub fn isDigits(s: []const u8) bool {
     if (s.len == 0) return false;
 
     var rem = s;
@@ -42,34 +42,34 @@ pub fn isNumber(s: []const u8) bool {
 }
 
 test "is str digit" {
-    try std.testing.expect(!isNumber("a"));
-    try std.testing.expect(isNumber("1"));
-    try std.testing.expect(isNumber("9"));
+    try std.testing.expect(!isDigits("a"));
+    try std.testing.expect(isDigits("1"));
+    try std.testing.expect(isDigits("9"));
 
     // 1 SIMD
     const simdV: [(std.simd.suggestVectorLength(u8) orelse 1)]u8 = @splat('7');
-    try std.testing.expect(isNumber(&simdV));
+    try std.testing.expect(isDigits(&simdV));
 
     // 1 unrolled
     const unrolledV: [8]u8 = @splat('7');
-    try std.testing.expect(isNumber(&unrolledV));
+    try std.testing.expect(isDigits(&unrolledV));
 
     // 1 SIMD + 1 unrolled + reminder
     const v: [(std.simd.suggestVectorLength(u8) orelse 1) + 8 + 2]u8 = simdV ++ unrolledV ++ .{ '7', '7' };
-    try std.testing.expect(isNumber(&v));
+    try std.testing.expect(isDigits(&v));
 
     // 1 SIMD bad
     var simdVBad: [(std.simd.suggestVectorLength(u8) orelse 1)]u8 = @splat('7');
     simdVBad[0] = 'a';
-    try std.testing.expect(!isNumber(&simdVBad));
+    try std.testing.expect(!isDigits(&simdVBad));
 
     // 1 unrolled bad
     var unrolledVBad: [8]u8 = @splat('7');
     unrolledVBad[7] = 'a';
-    try std.testing.expect(!isNumber(&unrolledVBad));
+    try std.testing.expect(!isDigits(&unrolledVBad));
 
     // 1 SIMD + 1 unrolled + reminder bad
     var vBad: [(std.simd.suggestVectorLength(u8) orelse 1) + 8 + 2]u8 = simdV ++ unrolledV ++ .{ '7', '7' };
     vBad[vBad.len - 1] = 'a';
-    try std.testing.expect(!isNumber(&vBad));
+    try std.testing.expect(!isDigits(&vBad));
 }
