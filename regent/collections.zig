@@ -229,6 +229,7 @@ pub fn ReverseTokenIterator(comptime T: type, comptime delimiter_type: std.mem.D
 }
 
 pub const BPlusTree = @import("collections/bplustree.zig").BPlusTree;
+pub const STree = @import("collections/stree.zig").STree;
 
 comptime {
     _ = std.testing.refAllDecls(@This());

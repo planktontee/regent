@@ -3,3 +3,4 @@ zig-out
 regent.zip
 zig-pkg
 test
+.vscode

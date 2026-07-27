@@ -10,13 +10,9 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
     comptime {
         const info = @typeInfo(K);
         if (info != .int) @compileError("K must be an int, got " ++ @typeName(K));
-
-        const bits = info.int.bits;
-        if (bits > 64) @compileError("K is capped at u64, got " ++ @typeName(K));
-
-        switch (bits) {
+        switch (info.int.bits) {
             8, 16, 32, 64 => {},
-            else => @compileError("K must be a power of two, got " ++ @typeName(K)),
+            else => @compileError("K must be a power of two capped at u64, got " ++ @typeName(K)),
         }
     }
 
@@ -112,6 +108,9 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
                 node = internal.children[childIndex(internal, key)];
             }
             const leaf: *Leaf = @ptrCast(node);
+            // vals sits in a different cacheline than keys, prefetch helps to make it ready
+            // for hit cases
+            if (comptime @sizeOf(V) != 0) @prefetch(&leaf.vals, .{});
             const idx = lowerBound(&leaf.keys, key);
             if (idx >= leaf.len or leaf.keys[idx] != key) return null;
             return &leaf.vals[idx];
@@ -430,7 +429,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
 
         pub const Block = struct {
             keys: []const K,
-            vals: []V,
+            values: []V,
         };
 
         pub const BlockIterator = struct {
@@ -439,7 +438,12 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             pub fn next(it: *@This()) ?Block {
                 const leaf = it.leaf orelse return null;
                 it.leaf = leaf.next;
-                return .{ .keys = leaf.keys[0..leaf.len], .vals = leaf.vals[0..leaf.len] };
+                //
+                if (leaf.next) |nx| @prefetch(nx, .{});
+                return .{
+                    .keys = leaf.keys[0..leaf.len],
+                    .values = leaf.vals[0..leaf.len],
+                };
             }
         };
     };
@@ -447,7 +451,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
 
 const testing = std.testing;
 
-test "sequential insert, get ordered" {
+test "bplustree: sequential insert, get ordered" {
     const Tree = BPlusTree(u64, u32);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
@@ -474,7 +478,7 @@ test "sequential insert, get ordered" {
     try testing.expectEqual(@as(u64, n), expect);
 }
 
-test "reverse insert stays sorted" {
+test "bplustree: reverse insert stays sorted" {
     const Tree = BPlusTree(u64, u64);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
@@ -494,7 +498,7 @@ test "reverse insert stays sorted" {
     try testing.expectEqual(@as(usize, 500), seen);
 }
 
-test "insert replace on duplicated keys" {
+test "bplustree: insert replace on duplicated keys" {
     const Tree = BPlusTree(u64, u32);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
@@ -505,7 +509,7 @@ test "insert replace on duplicated keys" {
     try testing.expectEqual(1, tree.len());
 }
 
-test "remove: drains to empty and reuses" {
+test "bplustree: remove: drains to empty and reuses" {
     const Tree = BPlusTree(u64, u64);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
@@ -538,7 +542,22 @@ test "remove: drains to empty and reuses" {
     try testing.expectEqual(@as(?u64, 7), tree.get(7));
 }
 
-test "maxInt and zero keys" {
+test "bplustree: maxInt vs padding disambiguation" {
+    const Tree = BPlusTree(u64, u32);
+    var tree: Tree = .empty;
+    defer tree.deinit(testing.allocator);
+
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) _ = try tree.insert(testing.allocator, i, @intCast(i));
+
+    try testing.expectEqual(@as(?u32, null), tree.get(std.math.maxInt(u64)));
+    _ = try tree.insert(testing.allocator, std.math.maxInt(u64), 777);
+    try testing.expectEqual(@as(?u32, 777), tree.get(std.math.maxInt(u64)));
+    try testing.expectEqual(@as(?u32, 777), tree.remove(std.math.maxInt(u64)));
+    try testing.expectEqual(@as(?u32, null), tree.get(std.math.maxInt(u64)));
+}
+
+test "bplustree: maxInt and zero keys" {
     const Tree = BPlusTree(u64, u8);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
@@ -557,7 +576,7 @@ test "maxInt and zero keys" {
     try testing.expectEqual(@as(?u8, 3), tree.get(max - 1));
 }
 
-test "block iterator matches entry iterator" {
+test "bplustree: block iterator matches entry iterator" {
     const Tree = BPlusTree(u64, u32);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
@@ -576,7 +595,7 @@ test "block iterator matches entry iterator" {
     var blocks = tree.blockIterator();
     var seen: usize = 0;
     while (blocks.next()) |blk| {
-        for (blk.keys, blk.vals) |k, v| {
+        for (blk.keys, blk.values) |k, v| {
             const e = entries.next().?;
             try testing.expectEqual(e.key, k);
             try testing.expectEqual(e.value.*, v);
@@ -587,7 +606,7 @@ test "block iterator matches entry iterator" {
     try testing.expectEqual(tree.len(), seen);
 }
 
-test "fuzz against hashmap reference" {
+test "bplustree: fuzz against hashmap reference" {
     const Tree = BPlusTree(u64, u64);
     var tree: Tree = .empty;
     defer tree.deinit(testing.allocator);
