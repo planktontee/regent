@@ -253,7 +253,7 @@ pub fn openStream(
             ),
             .named_pipe => {
                 var pipeSize = bufferConfig.defaultPipeSize;
-                if (openConfig.expandPipe) {
+                if (openConfig.expandPipe and bufferConfig.maxPipeSize > pipeSize) {
                     // Attempt to set pipesize to 1mb, this is best effort
                     if (expandPipeSize(context.io, file.handle, bufferConfig.maxPipeSize))
                         pipeSize = bufferConfig.maxPipeSize;
@@ -537,6 +537,13 @@ pub fn FileStream(mode: Mode) type {
             self.alignment = std.mem.Alignment.fromByteUnits(std.heap.pageSize());
         }
 
+        // While retain guarantees that the line will be retained in the resizeable input,
+        // lines returned by this method are not guaranteed to have their lifecycle tied to
+        // the actualy resizeable buffer
+        // that happens because on resize, all items move to a new contiguous memory area
+        // updates for consistency will require to know the first array len, then you can update
+        // all ptrs accordingly for line references
+        // another option is to store the old ptr so you can delta and then offset the new one
         pub fn readLineRetained(
             self: *@This(),
             allocator: std.mem.Allocator,
@@ -545,34 +552,45 @@ pub fn FileStream(mode: Mode) type {
             resizeable: anytype,
         ) !?[]const u8 {
             const r: *std.Io.Reader = &self.stream.interface;
-            var fillTarget: usize = 1;
+            var isDone = false;
+            var target = @min(r.end + 1, r.buffer.len);
             while (r.buffer.len > 0) {
-                r.fill(fillTarget) catch |e| switch (e) {
-                    error.EndOfStream => return null,
-                    else => return e,
-                };
+                // Avoids extra syscall for error
+                if (self.stream.size) |size| {
+                    if (size != 0 and resizeable.capacity >= size) {
+                        isDone = true;
+                    }
+                }
+
+                if (!isDone) {
+                    @branchHint(.likely);
+                    r.fill(target) catch |e| switch (e) {
+                        error.EndOfStream => isDone = true,
+                        else => return e,
+                    };
+                }
 
                 var buffered = r.buffered();
                 if (std.mem.findScalar(u8, buffered, '\n')) |idx| {
-                    fillTarget = 1;
+                    if (!isDone and r.buffer.len == idx + 1) {
+                        const bufferStartOffset = resizeable.capacity - r.buffer.len;
+                        resizeable.expandToCapacity();
+                        try resizeable.ensureTotalCapacity(allocator, @max(resizeable.capacity + resizeable.capacity / 2, resizeable.capacity + 1));
+                        r.buffer = resizeable.allocatedSlice()[bufferStartOffset..];
+                        target = r.end + 1;
+                    }
+
+                    const result = r.buffered();
                     r.buffer = r.buffer[idx + 1 ..];
                     r.seek = 0;
                     r.end = buffered.len - idx - 1;
-                    return buffered[0..idx];
-                } else {
-                    // This is only safe because we have a check for empty buffers
-                    // everything else in the buffer is the last line
-                    if (self.bufferType == .full) {
-                        r.buffer = buffered[buffered.len..];
-                        r.seek = 0;
-                        r.end = 0;
-                        return buffered;
-                    }
 
-                    // We could've buffered more but the underlaying Reader didnt buffer
-                    // more data, which means it's done and we should wrap up with whatever was buffered
-                    if (r.end < r.buffer.len) {
-                        r.buffer = r.buffer[r.buffer.len..];
+                    return result[0 .. idx + 1];
+                } else {
+                    if (isDone) {
+                        if (buffered.len == 0) return null;
+
+                        r.buffer = buffered[buffered.len..];
                         r.seek = 0;
                         r.end = 0;
                         return buffered;
@@ -583,18 +601,13 @@ pub fn FileStream(mode: Mode) type {
                     // read more things, which means we need to preserve what was buffered and request more
                     // bufferStartOffset represents where r.buffer started considered the original buffer
                     const bufferStartOffset = resizeable.capacity - r.buffer.len;
-                    // This is the remainder, that may or may not be finished
-                    const oldEnd = r.buffer.len;
 
                     // Internally ensureTotalCapacity wont expand or use past items.len for resize/remap, so we need
                     // this in order to retain because we arent fiddling with this buffer from inside the arraylist
                     resizeable.expandToCapacity();
-                    try resizeable.ensureTotalCapacity(allocator, resizeable.capacity + resizeable.capacity / 2);
+                    try resizeable.ensureTotalCapacity(allocator, @max(resizeable.capacity + resizeable.capacity / 2, resizeable.capacity + 1));
                     r.buffer = resizeable.allocatedSlice()[bufferStartOffset..];
-                    r.seek = 0;
-
-                    // next fill will ask for buffered + 1 to force a read
-                    fillTarget = oldEnd + 1;
+                    target = r.end + 1;
                 }
             }
             return null;
@@ -608,22 +621,25 @@ pub fn FileStream(mode: Mode) type {
             resizeable: anytype,
         ) ![]const u8 {
             const r: *std.Io.Reader = &self.stream.interface;
-            // This ensures .full ends up in EndOfStream right away
-            var fillTarget: usize = r.buffer.len;
             while (true) {
-                r.fill(fillTarget) catch |e| switch (e) {
+                // Avoid syscall on re-call
+                if (self.stream.size) |size|
+                    if (size != 0 and r.bufferedLen() == size) return r.buffered();
+
+                r.fill(r.buffer.len) catch |e| switch (e) {
                     error.EndOfStream => return r.buffered(),
                     else => return e,
                 };
 
+                // Avoid expansion when file is done
+                if (self.stream.size) |size|
+                    if (size != 0 and r.bufferedLen() == size) return r.buffered();
+
                 // Internally ensureTotalCapacity wont expand or use past items.len for resize/remap, so we need
                 // this in order to retain because we arent fiddling with this buffer from inside the arraylist
                 resizeable.expandToCapacity();
-                try resizeable.ensureTotalCapacity(allocator, resizeable.capacity + resizeable.capacity / 2);
+                try resizeable.ensureTotalCapacity(allocator, resizeable.capacity + resizeable.capacity / 4);
                 r.buffer = resizeable.allocatedSlice();
-
-                // next fill will ask for new buff.len + 1 to shoot for EndOfStream
-                fillTarget = r.buffer.len;
             }
             unreachable;
         }
@@ -976,8 +992,9 @@ pub const Utf8Cursor = struct {
     }
 };
 
+const testing = std.testing;
+
 test "utf8 cursor" {
-    const testing = std.testing;
     var reader: std.Io.Reader = .fixed(@as([]const u8, ([_]u8{
         'A',
         0x7F,
@@ -1049,4 +1066,288 @@ test "utf8 cursor" {
     try testing.expectEqual('💩', cursor.next());
     try testing.expectError(error.BadUtf8, cursor.next());
     try testing.expectEqual(null, cursor.next());
+}
+
+fn fuzzMakeFile(
+    maxSize: usize,
+    dir: std.Io.Dir,
+    io: std.Io,
+    allocator: Allocator,
+    name: []const u8,
+    rng: std.Random,
+) !struct { std.Io.File, []const u8, usize } {
+    const f = try dir.createFile(io, name, .{ .read = true });
+    errdefer f.close(io);
+
+    const size = rng.intRangeAtMost(usize, 0, maxSize);
+    var buf: [BufferConfig.defaultWriterConfig.fileBufferSize]u8 = undefined;
+
+    var fw = f.writer(io, &buf);
+    const w = &fw.interface;
+
+    var content: []u8 = try allocator.alloc(u8, size);
+    errdefer allocator.free(content);
+    const inputMod: u8 = 94;
+    const inputBase: u8 = 33;
+
+    var total: usize = 0;
+    var lines: usize = 0;
+    while (total < size) {
+        const lineSize = rng.intRangeAtMost(usize, 0, size - total - 1);
+        const unrollFactor = 8;
+
+        var reminder = lineSize;
+        if (std.simd.suggestVectorLength(u8)) |VLen| {
+            const Vec = @Vector(VLen, u8);
+            const base: Vec = @splat(inputBase);
+            const mod: Vec = @splat(inputMod);
+
+            var bufRng: [VLen]u8 = undefined;
+
+            while (reminder >= VLen) : (reminder -= VLen) {
+                rng.bytes(&bufRng);
+
+                const selected: Vec = @as(Vec, bufRng) % mod + base;
+
+                const offset = reminder - VLen;
+                @as(*[VLen]u8, content[total + offset ..][0..VLen]).* = selected;
+            }
+        }
+        var bufRng: [unrollFactor]u8 = undefined;
+        while (reminder >= unrollFactor) : (reminder -= unrollFactor) {
+            rng.bytes(&bufRng);
+            inline for (0..unrollFactor) |i| {
+                content[total + reminder - i - 1] = bufRng[i] % inputMod + inputBase;
+            }
+        }
+
+        rng.bytes(&bufRng);
+        for (0..reminder) |i| {
+            content[total + reminder - i - 1] = bufRng[i] % inputMod + inputBase;
+        }
+
+        content[total + lineSize] = '\n';
+        total += lineSize + 1;
+        lines += 1;
+    }
+
+    try w.writeAll(content);
+    try w.flush();
+
+    const stat = try f.stat(testing.io);
+    try testing.expectEqual(size, stat.size);
+
+    return .{ f, content, lines };
+}
+
+test "fuzz readFileRetained" {
+    var tmpDir = testing.tmpDir(.{});
+    defer tmpDir.cleanup();
+
+    var buf: [@sizeOf(u64)]u8 = undefined;
+    std.Io.random(testing.io, &buf);
+    var prng = std.Random.DefaultPrng.init(@bitCast(buf));
+
+    // var prng = std.Random.DefaultPrng.init(0x777A);
+    const rng = prng.random();
+
+    for (0..10) |i| {
+        var nameBuf: [64]u8 = undefined;
+        const fName = try std.fmt.bufPrint(&nameBuf, "fuzz{d}", .{i});
+
+        const f, const expected, _ = try fuzzMakeFile(
+            @as(usize, (1 << 20)) + rng.intRangeAtMost(usize, 1, std.math.maxInt(u16) - 1),
+            tmpDir.dir,
+            testing.io,
+            testing.allocator,
+            fName,
+            rng,
+        );
+        defer f.close(testing.io);
+        defer testing.allocator.free(expected);
+
+        var fs = try FileStream(.read).openStreamWithConfig(
+            .{ .io = testing.io, .allocator = testing.allocator },
+            f,
+            .{},
+            .unmanaged,
+            .defaultReaderConfig,
+            null,
+        );
+
+        const alignment: std.mem.Alignment = comptime .fromByteUnits(std.atomic.cache_line);
+        var arr: std.ArrayListAligned(u8, alignment) = try .initCapacity(testing.allocator, rng.intRangeAtMost(
+            usize,
+            1,
+            4096,
+        ));
+        defer arr.deinit(testing.allocator);
+
+        fs.setBuffer(alignment, arr.allocatedSlice());
+        const content = try fs.readFileRetained(testing.allocator, &arr);
+
+        try testing.expectEqualStrings(expected, content);
+    }
+}
+
+test "fuzz readLineRetained" {
+    var tmpDir = testing.tmpDir(.{});
+    defer tmpDir.cleanup();
+
+    var buf: [@sizeOf(u64)]u8 = undefined;
+    std.Io.random(testing.io, &buf);
+    var prng = std.Random.DefaultPrng.init(@bitCast(buf));
+
+    // var prng = std.Random.DefaultPrng.init(0x777A);
+    const rng = prng.random();
+
+    for (0..10) |i| {
+        var nameBuf: [64]u8 = undefined;
+        const fName = try std.fmt.bufPrint(&nameBuf, "fuzz{d}", .{i});
+
+        const f, const expected, const expectedLen = try fuzzMakeFile(
+            @as(usize, (1 << 20)) + rng.intRangeAtMost(usize, 1, std.math.maxInt(u16) - 1),
+            tmpDir.dir,
+            testing.io,
+            testing.allocator,
+            fName,
+            rng,
+        );
+        defer f.close(testing.io);
+        defer testing.allocator.free(expected);
+
+        var fs = try FileStream(.read).openStreamWithConfig(
+            .{ .io = testing.io, .allocator = testing.allocator },
+            f,
+            .{},
+            .unmanaged,
+            .defaultReaderConfig,
+            null,
+        );
+
+        const alignment: std.mem.Alignment = comptime .fromByteUnits(std.atomic.cache_line);
+        var arr: std.ArrayListAligned(u8, alignment) = try .initCapacity(testing.allocator, rng.intRangeAtMost(
+            usize,
+            1,
+            4096,
+        ));
+        defer arr.deinit(testing.allocator);
+
+        fs.setBuffer(alignment, arr.allocatedSlice());
+
+        var it = std.mem.splitScalar(u8, expected, '\n');
+        var actualLen: usize = 0;
+        while (it.next()) |line| {
+            if (try fs.readLineRetained(testing.allocator, &arr)) |actualLine| {
+                try testing.expectEqualStrings(line, actualLine[0..actualLine.len -| 1]);
+                actualLen += 1;
+            }
+        }
+        try testing.expectEqual(expectedLen, actualLen);
+    }
+}
+
+fn makeFile(
+    dir: std.Io.Dir,
+    io: std.Io,
+    name: []const u8,
+    content: []const []const u8,
+) !std.Io.File {
+    const f = try dir.createFile(io, name, .{ .read = true });
+    errdefer f.close(io);
+
+    var buf: [BufferConfig.defaultWriterConfig.fileBufferSize]u8 = undefined;
+
+    var fw = f.writer(testing.io, &buf);
+    const w = &fw.interface;
+
+    for (content) |line| {
+        try w.writeAll(line);
+    }
+    try w.flush();
+
+    return f;
+}
+
+fn randomName(allocator: Allocator) ![]const u8 {
+    var prng = std.Random.DefaultPrng.init(0x8A11);
+    const random = prng.random();
+    var buf: [16]u8 = undefined;
+    random.bytes(&buf);
+
+    for (0..buf.len) |i| {
+        buf[i] = buf[i] % (122 - 97) + 97;
+    }
+
+    const name = try allocator.alloc(u8, buf.len);
+    @memcpy(name, buf[0..]);
+    return name;
+}
+
+fn makeFileAndExpect(dir: std.Io.Dir, bufSize: usize, expect: []const []const u8, expectLen: usize) !void {
+    const name = try randomName(testing.allocator);
+    defer testing.allocator.free(name);
+
+    const f = try makeFile(
+        dir,
+        testing.io,
+        name,
+        expect,
+    );
+    defer f.close(testing.io);
+
+    const context: Context = .{ .io = testing.io, .allocator = testing.allocator };
+    var fs = try FileStream(.read).openStreamWithConfig(
+        context,
+        f,
+        .{},
+        .unmanaged,
+        .defaultReaderConfig,
+        null,
+    );
+
+    const alignment: std.mem.Alignment = comptime .fromByteUnits(std.atomic.cache_line);
+    var arr: std.ArrayListAligned(u8, alignment) = try .initCapacity(
+        testing.allocator,
+        bufSize,
+    );
+    defer arr.deinit(testing.allocator);
+
+    fs.setBuffer(alignment, arr.allocatedSlice());
+
+    var actualLen: usize = 0;
+    while (try fs.readLineRetained(testing.allocator, &arr)) |line| : (actualLen += 1) {
+        if (actualLen >= expectLen) try testing.expect(false);
+        try testing.expectEqualStrings(expect[actualLen], line);
+    }
+    try testing.expectEqual(expectLen, actualLen);
+}
+
+test "readLineRetained boundaries" {
+    var tmpDir = testing.tmpDir(.{});
+    defer tmpDir.cleanup();
+
+    var bufSize: usize = 1;
+    for (0..10) |i| {
+        try makeFileAndExpect(tmpDir.dir, bufSize, &.{
+            "asdb\n",
+            "asd\n",
+        }, 2);
+
+        try makeFileAndExpect(tmpDir.dir, bufSize, &.{
+            "asdb\n",
+            "asd",
+        }, 2);
+
+        try makeFileAndExpect(tmpDir.dir, bufSize, &.{
+            "\n",
+            "a",
+        }, 2);
+
+        try makeFileAndExpect(tmpDir.dir, bufSize, &.{"a"}, 1);
+        try makeFileAndExpect(tmpDir.dir, bufSize, &.{""}, 0);
+        try makeFileAndExpect(tmpDir.dir, bufSize, &.{"\n"}, 1);
+
+        bufSize = @as(usize, 1) << @as(u6, @intCast(i));
+    }
 }
