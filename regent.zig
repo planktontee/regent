@@ -13,6 +13,7 @@ pub const trampoline = @import("regent/trampoline.zig");
 pub const tagged = @import("regent/tagged.zig");
 pub const hash = @import("regent/hash.zig");
 pub const str = @import("regent/str.zig");
+pub const sort = @import("regent/sort.zig");
 
 comptime {
     const std = @import("std");
