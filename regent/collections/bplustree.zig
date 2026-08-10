@@ -4,7 +4,12 @@ const assertM = @import("../ergo.zig").assertM;
 
 const blockLineFactor = 1;
 
-pub fn BPlusTree(comptime K: type, comptime V: type) type {
+pub const ComparisonMode = enum {
+    lt,
+    gt,
+};
+
+pub fn BPlusTree(comptime comparison: ComparisonMode, comptime K: type, comptime V: type) type {
     const blockByte = std.atomic.cache_line * blockLineFactor;
 
     comptime {
@@ -36,7 +41,10 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
         pub const minKeys = W / 2 - 1;
 
         const KeyVec = @Vector(W, K);
-        const sentinel: K = std.math.maxInt(K);
+        const sentinel: K = switch (comparison) {
+            .lt => std.math.maxInt(K),
+            .gt => std.math.minInt(K),
+        };
         const emptyKeys: [W]K = @splat(sentinel);
 
         // While descending, if at height 0, those are leafs, otherwise they are internal
@@ -65,7 +73,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
         height: u32 = 0,
         // folds merge right into left, so head is destroyed when empty
         head: ?*Leaf = null,
-        count: usize = 0,
+        size: usize = 0,
 
         leafPool: std.heap.MemoryPool(Leaf) = .empty,
         internalPool: std.heap.MemoryPool(Internal) = .empty,
@@ -78,15 +86,14 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             self.* = undefined;
         }
 
-        pub fn len(self: *const Self) usize {
-            return self.count;
-        }
-
         // Index of the first key >= probe, results in len when all keys are smaller
         // Sentinel never counts, sentinel < probe is always false
         fn lowerBound(keys: *align(std.atomic.cache_line) const [W]K, probe: K) u32 {
             const kv: KeyVec = keys.*;
-            return std.simd.countTrues(kv < @as(KeyVec, @splat(probe)));
+            return switch (comptime comparison) {
+                .lt => std.simd.countTrues(kv < @as(KeyVec, @splat(probe))),
+                .gt => std.simd.countTrues(kv > @as(KeyVec, @splat(probe))),
+            };
         }
 
         fn childIndex(node: *const Internal, probe: K) u32 {
@@ -201,7 +208,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
                 leaf.len = 1;
                 self.root = @ptrCast(leaf);
                 self.head = leaf;
-                self.count = 1;
+                self.size = 1;
                 return null;
             };
 
@@ -224,7 +231,10 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
                 if (nodeLen(internal.children[idx], level - 1) == W) {
                     try self.splitChild(allocator, internal, idx, level - 1);
                     // split put a new separator into idx, so we need to move it forward
-                    if (key > internal.keys[idx]) idx += 1;
+                    if (switch (comptime comparison) {
+                        .lt => key > internal.keys[idx],
+                        .gt => key < internal.keys[idx],
+                    }) idx += 1;
                 }
                 node = internal.children[idx];
             }
@@ -237,7 +247,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
                 return old;
             }
             leafInsertAt(leaf, idx, key, value);
-            self.count += 1;
+            self.size += 1;
             return null;
         }
 
@@ -386,7 +396,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             if (idx >= leaf.len or leaf.keys[idx] != key) return null;
             const old = leaf.vals[idx];
             leafRemoveAt(leaf, idx);
-            self.count -= 1;
+            self.size -= 1;
 
             if (leaf.len == 0 and self.height == 0) {
                 self.leafPool.destroy(leaf);
@@ -452,195 +462,307 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
 const testing = std.testing;
 
 test "bplustree: sequential insert, get ordered" {
-    const Tree = BPlusTree(u64, u32);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u32);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    const n = 1000;
-    var i: u64 = 0;
-    while (i < n) : (i += 1) {
-        try testing.expectEqual(@as(?u32, null), try tree.insert(testing.allocator, i * 7, @intCast(i)));
-    }
-    try testing.expectEqual(@as(usize, n), tree.len());
+        const n = 1000;
+        var i: u64 = switch (mode) {
+            .lt => 0,
+            .gt => n,
+        };
+        while (switch (mode) {
+            .lt => i < n,
+            .gt => i > 0,
+        }) : (switch (mode) {
+            .lt => i += 1,
+            .gt => i -= 1,
+        }) {
+            try testing.expectEqual(null, try tree.insert(testing.allocator, i * 7, @intCast(i)));
+        }
+        try testing.expectEqual(n, tree.size);
 
-    i = 0;
-    while (i < n) : (i += 1) {
-        try testing.expectEqual(@as(?u32, @intCast(i)), tree.get(i * 7));
-        try testing.expect(!tree.contains(i * 7 + 1));
-    }
+        i = switch (mode) {
+            .lt => 0,
+            .gt => n,
+        };
+        while (switch (mode) {
+            .lt => i < n,
+            .gt => i > 0,
+        }) : (switch (mode) {
+            .lt => i += 1,
+            .gt => i -= 1,
+        }) {
+            try testing.expectEqual(@as(?u32, @intCast(i)), tree.get(i * 7));
+            try testing.expect(!tree.contains(i * 7 + 1));
+        }
 
-    var it = tree.iterator();
-    var expect: u64 = 0;
-    while (it.next()) |e| : (expect += 1) {
-        try testing.expectEqual(expect * 7, e.key);
-        try testing.expectEqual(@as(u32, @intCast(expect)), e.value.*);
+        var it = tree.iterator();
+        var expect: u64 = switch (mode) {
+            .lt => 0,
+            .gt => 1000,
+        };
+        while (it.next()) |e| : (switch (mode) {
+            .lt => expect += 1,
+            .gt => expect -|= 1,
+        }) {
+            try testing.expectEqual(expect * 7, e.key);
+            try testing.expectEqual(expect, e.value.*);
+        }
+        try testing.expectEqual(switch (mode) {
+            .lt => n,
+            .gt => 0,
+        }, expect);
     }
-    try testing.expectEqual(@as(u64, n), expect);
 }
 
 test "bplustree: reverse insert stays sorted" {
-    const Tree = BPlusTree(u64, u64);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u64);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    var i: u64 = 500;
-    while (i > 0) : (i -= 1) {
-        _ = try tree.insert(testing.allocator, i, i);
-    }
+        var i: u64 = switch (mode) {
+            .lt => 500,
+            .gt => 0,
+        };
+        while (switch (mode) {
+            .lt => i > 0,
+            .gt => i < 500,
+        }) : (switch (mode) {
+            .lt => i -= 1,
+            .gt => i += 1,
+        }) {
+            _ = try tree.insert(testing.allocator, i, i);
+        }
 
-    var it = tree.iterator();
-    var prev: u64 = 0;
-    var seen: usize = 0;
-    while (it.next()) |e| : (seen += 1) {
-        try testing.expect(e.key > prev);
-        prev = e.key;
+        var it = tree.iterator();
+        var prev: u64 = switch (mode) {
+            .lt => 0,
+            .gt => 500,
+        };
+        var seen: usize = 0;
+
+        while (it.next()) |e| : (seen += 1) {
+            try testing.expect(switch (mode) {
+                .lt => e.key > prev,
+                .gt => e.key < prev,
+            });
+            prev = e.key;
+        }
+        try testing.expectEqual(500, seen);
     }
-    try testing.expectEqual(@as(usize, 500), seen);
 }
 
 test "bplustree: insert replace on duplicated keys" {
-    const Tree = BPlusTree(u64, u32);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u32);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(?u32, null), try tree.insert(testing.allocator, 42, 1));
-    try testing.expectEqual(@as(?u32, 1), try tree.insert(testing.allocator, 42, 2));
-    try testing.expectEqual(@as(?u32, 2), tree.get(42));
-    try testing.expectEqual(1, tree.len());
+        try testing.expectEqual(null, try tree.insert(testing.allocator, 42, 1));
+        try testing.expectEqual(1, try tree.insert(testing.allocator, 42, 2));
+        try testing.expectEqual(2, tree.get(42));
+        try testing.expectEqual(1, tree.size);
+    }
 }
 
 test "bplustree: remove: drains to empty and reuses" {
-    const Tree = BPlusTree(u64, u64);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u64);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    const n = 800;
-    var i: u64 = 0;
-    while (i < n) : (i += 1) _ = try tree.insert(testing.allocator, i, i * 2);
+        const n = 800;
+        var i: u64 = 0;
+        while (i < n) : (i += 1) _ = try tree.insert(testing.allocator, i, i * 2);
 
-    i = 0;
-    while (i < n) : (i += 2) {
-        try testing.expectEqual(@as(?u64, i * 2), tree.remove(i));
-        try testing.expectEqual(@as(?u64, null), tree.remove(i));
+        i = 0;
+        while (i < n) : (i += 2) {
+            try testing.expectEqual(i * 2, tree.remove(i));
+            try testing.expectEqual(null, tree.remove(i));
+        }
+        try testing.expectEqual(n / 2, tree.size);
+
+        var it = tree.iterator();
+        var expect: u64 = switch (mode) {
+            .lt => 1,
+            .gt => n - 1,
+        };
+        while (it.next()) |e| : (switch (mode) {
+            .lt => expect += 2,
+            // this will saturate but we should end the iterator right after
+            .gt => expect -|= 2,
+        }) {
+            try testing.expectEqual(expect, e.key);
+        }
+
+        i = 1;
+        while (i < n) : (i += 2) _ = tree.remove(i);
+        try testing.expectEqual(0, tree.size);
+        try testing.expectEqual(null, tree.get(3));
+        var emptyIt = tree.iterator();
+        try testing.expectEqual(null, emptyIt.next());
+
+        _ = try tree.insert(testing.allocator, 7, 7);
+        try testing.expectEqual(7, tree.get(7));
     }
-    try testing.expectEqual(@as(usize, n / 2), tree.len());
-
-    var it = tree.iterator();
-    var expect: u64 = 1;
-    while (it.next()) |e| : (expect += 2) {
-        try testing.expectEqual(expect, e.key);
-    }
-
-    i = 1;
-    while (i < n) : (i += 2) _ = tree.remove(i);
-    try testing.expectEqual(@as(usize, 0), tree.len());
-    try testing.expectEqual(@as(?u64, null), tree.get(3));
-    var emptyIt = tree.iterator();
-    try testing.expectEqual(@as(?Tree.Entry, null), emptyIt.next());
-
-    _ = try tree.insert(testing.allocator, 7, 7);
-    try testing.expectEqual(@as(?u64, 7), tree.get(7));
 }
 
-test "bplustree: maxInt vs padding disambiguation" {
-    const Tree = BPlusTree(u64, u32);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+test "stree: key widths derive W, natural widths work" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        inline for ([_]type{ u16, u32, u64, i32 }) |Key| {
+            const Tree = BPlusTree(mode, Key, u32);
+            try testing.expectEqual(
+                blockLineFactor * std.atomic.cache_line,
+                Tree.width * @sizeOf(Key),
+            );
 
-    var i: u64 = 0;
-    while (i < 100) : (i += 1) _ = try tree.insert(testing.allocator, i, @intCast(i));
+            var tree: Tree = .empty;
+            defer tree.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(?u32, null), tree.get(std.math.maxInt(u64)));
-    _ = try tree.insert(testing.allocator, std.math.maxInt(u64), 777);
-    try testing.expectEqual(@as(?u32, 777), tree.get(std.math.maxInt(u64)));
-    try testing.expectEqual(@as(?u32, 777), tree.remove(std.math.maxInt(u64)));
-    try testing.expectEqual(@as(?u32, null), tree.get(std.math.maxInt(u64)));
+            var prng = std.Random.DefaultPrng.init(@bitSizeOf(Key));
+            const random = prng.random();
+            var i: u64 = 0;
+            while (i < 2000) : (i += 1) {
+                _ = try tree.insert(testing.allocator, random.int(Key), @truncate(i));
+            }
+
+            var it = tree.iterator();
+            var prev: ?Key = null;
+            var seen: usize = 0;
+            while (it.next()) |e| : (seen += 1) {
+                if (prev) |p| switch (mode) {
+                    .lt => try testing.expect(e.key > p),
+                    .gt => try testing.expect(e.key < p),
+                };
+                prev = e.key;
+            }
+            try testing.expectEqual(tree.size, seen);
+        }
+    }
+}
+
+test "bplustree: sentinel vs padding disambiguation" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const sentinel = switch (mode) {
+            .lt => std.math.maxInt(u64),
+            .gt => 0,
+        };
+
+        const Tree = BPlusTree(.lt, u64, u32);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
+
+        // we reserve 0 for the boundary checks
+        var i: u64 = switch (mode) {
+            .lt => 0,
+            .gt => 1,
+        };
+        while (i < 100) : (i += 1) _ = try tree.insert(testing.allocator, i, @intCast(i));
+
+        try testing.expectEqual(null, tree.get(sentinel));
+        _ = try tree.insert(testing.allocator, sentinel, 777);
+        try testing.expectEqual(777, tree.get(sentinel));
+        try testing.expectEqual(777, tree.remove(sentinel));
+        try testing.expectEqual(null, tree.get(sentinel));
+    }
 }
 
 test "bplustree: maxInt and zero keys" {
-    const Tree = BPlusTree(u64, u8);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u8);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    const max = std.math.maxInt(u64);
-    _ = try tree.insert(testing.allocator, max, 1);
-    _ = try tree.insert(testing.allocator, 0, 2);
-    _ = try tree.insert(testing.allocator, max - 1, 3);
+        const max = std.math.maxInt(u64);
+        _ = try tree.insert(testing.allocator, max, 1);
+        _ = try tree.insert(testing.allocator, 0, 2);
+        _ = try tree.insert(testing.allocator, max - 1, 3);
 
-    try testing.expectEqual(@as(?u8, 1), tree.get(max));
-    try testing.expectEqual(@as(?u8, 2), tree.get(0));
-    try testing.expectEqual(@as(?u8, 3), tree.get(max - 1));
+        try testing.expectEqual(1, tree.get(max));
+        try testing.expectEqual(2, tree.get(0));
+        try testing.expectEqual(3, tree.get(max - 1));
 
-    try testing.expectEqual(@as(?u8, 1), tree.remove(max));
-    try testing.expectEqual(@as(?u8, null), tree.get(max));
-    try testing.expectEqual(@as(?u8, 3), tree.get(max - 1));
+        try testing.expectEqual(1, tree.remove(max));
+        try testing.expectEqual(null, tree.get(max));
+        try testing.expectEqual(3, tree.get(max - 1));
+    }
 }
 
 test "bplustree: block iterator matches entry iterator" {
-    const Tree = BPlusTree(u64, u32);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u32);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    var prng = std.Random.DefaultPrng.init(0xB10C);
-    const random = prng.random();
-    var i: usize = 0;
-    while (i < 2500) : (i += 1) _ = try tree.insert(testing.allocator, random.int(u48), @intCast(i));
+        var prng = std.Random.DefaultPrng.init(0xB10C);
+        const random = prng.random();
+        var i: usize = 0;
+        while (i < 2500) : (i += 1) _ = try tree.insert(testing.allocator, random.int(u48), @intCast(i));
 
-    i = 0;
-    var prng2 = std.Random.DefaultPrng.init(0xB10C);
-    const random2 = prng2.random();
-    while (i < 1000) : (i += 1) _ = tree.remove(random2.int(u48));
+        i = 0;
+        var prng2 = std.Random.DefaultPrng.init(0xB10C);
+        const random2 = prng2.random();
+        while (i < 1000) : (i += 1) _ = tree.remove(random2.int(u48));
 
-    var entries = tree.iterator();
-    var blocks = tree.blockIterator();
-    var seen: usize = 0;
-    while (blocks.next()) |blk| {
-        for (blk.keys, blk.values) |k, v| {
-            const e = entries.next().?;
-            try testing.expectEqual(e.key, k);
-            try testing.expectEqual(e.value.*, v);
-            seen += 1;
+        var entries = tree.iterator();
+        var blocks = tree.blockIterator();
+        var seen: usize = 0;
+        while (blocks.next()) |blk| {
+            for (blk.keys, blk.values) |k, v| {
+                const e = entries.next().?;
+                try testing.expectEqual(e.key, k);
+                try testing.expectEqual(e.value.*, v);
+                seen += 1;
+            }
         }
+        try testing.expectEqual(null, entries.next());
+        try testing.expectEqual(tree.size, seen);
     }
-    try testing.expectEqual(@as(?Tree.Entry, null), entries.next());
-    try testing.expectEqual(tree.len(), seen);
 }
 
 test "bplustree: fuzz against hashmap reference" {
-    const Tree = BPlusTree(u64, u64);
-    var tree: Tree = .empty;
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = BPlusTree(mode, u64, u64);
+        var tree: Tree = .empty;
+        defer tree.deinit(testing.allocator);
 
-    var ref: std.AutoHashMapUnmanaged(u64, u64) = .empty;
-    defer ref.deinit(testing.allocator);
+        var ref: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer ref.deinit(testing.allocator);
 
-    var prng = std.Random.DefaultPrng.init(0xB7EE);
-    const random = prng.random();
+        var prng = std.Random.DefaultPrng.init(0xB7EE);
+        const random = prng.random();
 
-    var op: usize = 0;
-    while (op < 20000) : (op += 1) {
-        // Forcing churn for update/removes
-        const key = random.uintLessThan(u64, 4096);
-        if (random.boolean()) {
-            const val = random.int(u64);
-            const treeOld = try tree.insert(testing.allocator, key, val);
-            const refOld = try ref.fetchPut(testing.allocator, key, val);
-            try testing.expectEqual(if (refOld) |kv| @as(?u64, kv.value) else null, treeOld);
-        } else {
-            const treeOld = tree.remove(key);
-            const refOld = ref.fetchRemove(key);
-            try testing.expectEqual(if (refOld) |kv| @as(?u64, kv.value) else null, treeOld);
+        var op: usize = 0;
+        while (op < 20000) : (op += 1) {
+            // Forcing churn for update/removes
+            const key = random.uintLessThan(u64, 4096);
+            if (random.boolean()) {
+                const val = random.int(u64);
+                const treeOld = try tree.insert(testing.allocator, key, val);
+                const refOld = try ref.fetchPut(testing.allocator, key, val);
+                try testing.expectEqual(if (refOld) |kv| kv.value else null, treeOld);
+            } else {
+                const treeOld = tree.remove(key);
+                const refOld = ref.fetchRemove(key);
+                try testing.expectEqual(if (refOld) |kv| kv.value else null, treeOld);
+            }
+            try testing.expectEqual(ref.count(), tree.size);
         }
-        try testing.expectEqual(@as(usize, ref.count()), tree.len());
-    }
 
-    var it = tree.iterator();
-    var prev: ?u64 = null;
-    var seen: usize = 0;
-    while (it.next()) |e| : (seen += 1) {
-        if (prev) |p| try testing.expect(e.key > p);
-        prev = e.key;
-        try testing.expectEqual(@as(?u64, ref.get(e.key)), e.value.*);
+        var it = tree.iterator();
+        var prev: ?u64 = null;
+        var seen: usize = 0;
+        while (it.next()) |e| : (seen += 1) {
+            if (prev) |p| switch (mode) {
+                .lt => try testing.expect(e.key > p),
+                .gt => try testing.expect(e.key < p),
+            };
+            prev = e.key;
+            try testing.expectEqual(ref.get(e.key), e.value.*);
+        }
+        try testing.expectEqual(ref.count(), seen);
     }
-    try testing.expectEqual(@as(usize, ref.count()), seen);
 }

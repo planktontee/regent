@@ -3,7 +3,12 @@ const Allocator = std.mem.Allocator;
 
 pub const blockLineFactor = 1;
 
-pub fn STree(comptime K: type, comptime V: type) type {
+pub const ComparisonMode = enum {
+    lt,
+    gt,
+};
+
+pub fn STree(comptime comparison: ComparisonMode, comptime K: type, comptime V: type) type {
     comptime {
         const info = @typeInfo(K);
         if (info != .int) @compileError("K must be an int, got " ++ @typeName(K));
@@ -30,7 +35,10 @@ pub fn STree(comptime K: type, comptime V: type) type {
         pub const maxBlocks: usize = @as(usize, std.math.maxInt(u16));
 
         const KeyVec = @Vector(W, K);
-        const sentinel: K = std.math.maxInt(K);
+        const sentinel: K = switch (comparison) {
+            .lt => std.math.maxInt(K),
+            .gt => std.math.minInt(K),
+        };
 
         const keyBlockBytes = blockBytes;
 
@@ -47,11 +55,27 @@ pub fn STree(comptime K: type, comptime V: type) type {
         height: u16 = 0,
         head: u16 = none,
         free: u16 = 0,
-        count: u32 = 0,
+        size: u32 = 0,
+        // This is entirely unused, it's here for users to be able to see the absolute floor
+        // without getting an error
+        // mathematically it can be more
         capacity: u32,
 
-        pub fn init(allocator: Allocator, capacity: u32) !Self {
-            const leaves = capacity / minKeys + 2;
+        // guaranteedCapacity can only guarantee that the bare minimum will hold
+        // but makes no promises on the upper limits
+        // because left/right for inner nodes split asymetrically, worst case for
+        // left-leaning or right-leaning inserts (in-order or reverse order in case of .lt)
+        // can look very close to the bottom, but still different between themselves due to the fronzen
+        // inner left being (if W = 16) (W / 2 - 1 = 7) and the right being 8
+        // so the absolute worst case for insertion only is 7 * blocks(capacity / minkeys + 2)
+        // example: 1000 capacity, W = 16, minKeys = 7, blocks = 170, worst case for insertion 1190
+        // For deletion the numbers get a bit worse because of the inner node split
+        // example: 1000 capacity, W = 16, minKeys = 7, blocks = 170, 7/8 all nodes for a 6.125 rate
+        //          170 * 6.125 ~ 1041.25, leaves wont respect this
+        // That deletion lower bound is false but a good estimate, leaves have to be there and their
+        // vacancy rate is less bad
+        pub fn init(allocator: Allocator, guaranteedCapacity: u32) !Self {
+            const leaves = guaranteedCapacity / minKeys + 2;
             var total: usize = leaves;
             var level: usize = leaves;
 
@@ -82,7 +106,7 @@ pub fn STree(comptime K: type, comptime V: type) type {
                 .childrenPtr = @ptrCast(@alignCast(slab.ptr + childrenOff)),
                 .lensPtr = @ptrCast(@alignCast(slab.ptr + lenOff)),
                 .nextPtr = @ptrCast(@alignCast(slab.ptr + nextOff)),
-                .capacity = capacity,
+                .capacity = guaranteedCapacity,
             };
 
             // Free chain runs through next array, ensures swaps for free and alloc
@@ -98,8 +122,8 @@ pub fn STree(comptime K: type, comptime V: type) type {
             self.* = undefined;
         }
 
-        pub fn len(self: *const Self) usize {
-            return self.count;
+        pub fn isSaturated(self: *const Self) bool {
+            return self.size >= self.capacity;
         }
 
         fn keysOf(self: *const Self, b: u16) *align(std.atomic.cache_line) [W]K {
@@ -124,7 +148,9 @@ pub fn STree(comptime K: type, comptime V: type) type {
 
         fn allocBlock(self: *Self) !u16 {
             const b = self.free;
-            if (b == none) return error.Full;
+            if (b == none) {
+                return error.Full;
+            }
 
             // This is stored away to avoid forced re-calculation of ptrs
             // on store
@@ -144,7 +170,10 @@ pub fn STree(comptime K: type, comptime V: type) type {
 
         fn lowerBound(keys: *align(std.atomic.cache_line) const [W]K, probe: K) u32 {
             const kv: KeyVec = keys.*;
-            return std.simd.countTrues(kv < @as(KeyVec, @splat(probe)));
+            return switch (comptime comparison) {
+                .lt => std.simd.countTrues(kv < @as(KeyVec, @splat(probe))),
+                .gt => std.simd.countTrues(kv > @as(KeyVec, @splat(probe))),
+            };
         }
 
         fn childIndex(self: *const Self, b: u16, probe: K) u32 {
@@ -255,7 +284,7 @@ pub fn STree(comptime K: type, comptime V: type) type {
                 self.lens()[b] = 1;
                 self.root = b;
                 self.head = b;
-                self.count = 1;
+                self.size = 1;
                 return null;
             }
 
@@ -283,7 +312,10 @@ pub fn STree(comptime K: type, comptime V: type) type {
                 if (self.lens()[self.childrenOf(b)[idx]] == W) {
                     try self.splitChild(b, idx, level - 1);
                     // Key was added to parent, so it must be shifted
-                    if (key > self.keysOf(b)[idx]) idx += 1;
+                    if (switch (comptime comparison) {
+                        .lt => key > self.keysOf(b)[idx],
+                        .gt => key < self.keysOf(b)[idx],
+                    }) idx += 1;
                 }
                 b = self.childrenOf(b)[idx];
             }
@@ -296,7 +328,7 @@ pub fn STree(comptime K: type, comptime V: type) type {
                 return old;
             }
             self.leafInsertAt(b, idx, key, value);
-            self.count += 1;
+            self.size += 1;
             return null;
         }
 
@@ -435,7 +467,7 @@ pub fn STree(comptime K: type, comptime V: type) type {
             if (idx >= self.lens()[b] or keys[idx] != key) return null;
             const old = self.valsOf(b)[idx];
             self.leafRemoveAt(b, idx);
-            self.count -= 1;
+            self.size -= 1;
 
             if (self.lens()[b] == 0 and self.height == 0) {
                 self.freeBlock(b);
@@ -508,272 +540,383 @@ pub fn STree(comptime K: type, comptime V: type) type {
 const testing = std.testing;
 
 test "stree: sequential insert, get ordered" {
-    const Tree = STree(u64, u32);
-    var tree: Tree = try .init(testing.allocator, 2000);
-    defer tree.deinit(testing.allocator);
-
-    const n = 1000;
-    var i: u64 = 0;
-    while (i < n) : (i += 1) {
-        try testing.expectEqual(@as(?u32, null), try tree.insert(i * 7, @intCast(i)));
-    }
-    try testing.expectEqual(@as(usize, n), tree.len());
-
-    i = 0;
-    while (i < n) : (i += 1) {
-        try testing.expectEqual(@as(?u32, @intCast(i)), tree.get(i * 7));
-        try testing.expect(!tree.contains(i * 7 + 1));
-    }
-
-    var it = tree.iterator();
-    var expect: u64 = 0;
-    while (it.next()) |e| : (expect += 1) {
-        try testing.expectEqual(expect * 7, e.key);
-        try testing.expectEqual(@as(u32, @intCast(expect)), e.value.*);
-    }
-    try testing.expectEqual(@as(u64, n), expect);
-}
-
-test "stree: reverse insert stays sorted" {
-    const Tree = STree(u64, u64);
-    var tree: Tree = try .init(testing.allocator, 1000);
-    defer tree.deinit(testing.allocator);
-
-    var i: u64 = 500;
-    while (i > 0) : (i -= 1) {
-        _ = try tree.insert(i, i);
-    }
-
-    var it = tree.iterator();
-    var prev: u64 = 0;
-    var seen: usize = 0;
-    while (it.next()) |e| : (seen += 1) {
-        try testing.expect(e.key > prev);
-        prev = e.key;
-    }
-    try testing.expectEqual(@as(usize, 500), seen);
-}
-
-test "stree: remove drains to empty and reuses" {
-    const Tree = STree(u64, u64);
-    var tree: Tree = try .init(testing.allocator, 1000);
-    defer tree.deinit(testing.allocator);
-
-    const n = 800;
-    var i: u64 = 0;
-    while (i < n) : (i += 1) _ = try tree.insert(i, i * 2);
-
-    i = 0;
-    while (i < n) : (i += 2) {
-        try testing.expectEqual(@as(?u64, i * 2), tree.remove(i));
-        try testing.expectEqual(@as(?u64, null), tree.remove(i));
-    }
-    try testing.expectEqual(@as(usize, n / 2), tree.len());
-
-    var it = tree.iterator();
-    var expect: u64 = 1;
-    while (it.next()) |e| : (expect += 2) {
-        try testing.expectEqual(expect, e.key);
-    }
-
-    i = 1;
-    while (i < n) : (i += 2) _ = tree.remove(i);
-    try testing.expectEqual(@as(usize, 0), tree.len());
-    try testing.expectEqual(@as(?u64, null), tree.get(3));
-    var emptyIt = tree.iterator();
-    try testing.expectEqual(@as(?Tree.Entry, null), emptyIt.next());
-
-    _ = try tree.insert(7, 7);
-    try testing.expectEqual(@as(?u64, 7), tree.get(7));
-}
-
-test "stree: error.Full at pool exhaustion, tree stays valid" {
-    const Tree = STree(u64, u32);
-    var tree: Tree = try .init(testing.allocator, 1000);
-    defer tree.deinit(testing.allocator);
-
-    var i: u64 = 0;
-    var hitFull = false;
-    while (i < 100000) : (i += 1) {
-        _ = tree.insert(i, @intCast(i)) catch |e| {
-            try testing.expectEqual(error.Full, e);
-            hitFull = true;
-            break;
-        };
-    }
-    try testing.expect(hitFull);
-
-    var it = tree.iterator();
-    var expect: u64 = 0;
-    while (it.next()) |e| : (expect += 1) {
-        try testing.expectEqual(expect, e.key);
-    }
-    try testing.expectEqual(tree.len(), expect);
-    try testing.expect(expect >= 64);
-}
-
-test "stree: block iterator matches entry iterator" {
-    const Tree = STree(u64, u32);
-    var tree: Tree = try .init(testing.allocator, 3000);
-    defer tree.deinit(testing.allocator);
-
-    var prng = std.Random.DefaultPrng.init(0xB10C);
-    const random = prng.random();
-    var i: usize = 0;
-    while (i < 2500) : (i += 1) _ = try tree.insert(random.int(u48), @intCast(i));
-
-    i = 0;
-    var prng2 = std.Random.DefaultPrng.init(0xB10C);
-    const random2 = prng2.random();
-    while (i < 1000) : (i += 1) _ = tree.remove(random2.int(u48));
-
-    var entries = tree.iterator();
-    var blocks = tree.blockIterator();
-    var seen: usize = 0;
-    while (blocks.next()) |blk| {
-        for (blk.keys, blk.values) |k, v| {
-            const e = entries.next().?;
-            try testing.expectEqual(e.key, k);
-            try testing.expectEqual(e.value.*, v);
-            seen += 1;
-        }
-    }
-    try testing.expectEqual(@as(?Tree.Entry, null), entries.next());
-    try testing.expectEqual(tree.len(), seen);
-}
-
-test "stree: void values (set mode)" {
-    const Tree = STree(u64, void);
-    var set: Tree = try .init(testing.allocator, 2000);
-    defer set.deinit(testing.allocator);
-
-    var i: usize = 0;
-    while (i < 1500) : (i += 1) {
-        try testing.expectEqual(@as(?void, null), try set.insert(i * 3, {}));
-    }
-    try testing.expectEqual(@as(usize, 1500), set.len());
-    try testing.expect(set.contains(300));
-    try testing.expect(!set.contains(301));
-    try testing.expect((try set.insert(300, {})) != null);
-
-    var it = set.iterator();
-    var expect: u64 = 0;
-    while (it.next()) |e| : (expect += 1) {
-        try testing.expectEqual(expect * 3, e.key);
-    }
-    try testing.expectEqual(@as(u64, 1500), expect);
-
-    try testing.expect(set.remove(300) != null);
-    try testing.expect(!set.contains(300));
-
-    // Segment for values must be zero bytes for void
-    var tree: STree(u64, u32) = try .init(testing.allocator, 2000);
-    defer tree.deinit(testing.allocator);
-    try testing.expect(tree.slab.len > set.slab.len);
-    try testing.expectEqual(
-        tree.slab.len - @as(usize, tree.blocks) * STree(u64, u32).width * @sizeOf(u32),
-        set.slab.len,
-    );
-}
-
-test "stree: key widths derive W, natural widths work" {
-    inline for ([_]type{ u16, u32, u64, i32 }) |Key| {
-        const Tree = STree(Key, u32);
-        try testing.expectEqual(
-            blockLineFactor * std.atomic.cache_line,
-            Tree.width * @sizeOf(Key),
-        );
-
-        var tree: Tree = try .init(testing.allocator, 3000);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u32);
+        var tree: Tree = try .init(testing.allocator, 2000);
         defer tree.deinit(testing.allocator);
 
-        var prng = std.Random.DefaultPrng.init(@bitSizeOf(Key));
-        const random = prng.random();
+        const n = 1000;
         var i: u64 = 0;
-        while (i < 2000) : (i += 1) {
-            _ = try tree.insert(random.int(Key), @truncate(i));
+        while (i < n) : (i += 1) {
+            try testing.expectEqual(null, try tree.insert(i * 7, @intCast(i)));
+        }
+        try testing.expectEqual(n, tree.size);
+
+        i = 0;
+        while (i < n) : (i += 1) {
+            try testing.expectEqual(@as(?u32, @intCast(i)), tree.get(i * 7));
+            try testing.expect(!tree.contains(i * 7 + 1));
         }
 
         var it = tree.iterator();
-        var prev: ?Key = null;
-        var seen: usize = 0;
-        while (it.next()) |e| : (seen += 1) {
-            if (prev) |pk| try testing.expect(e.key > pk);
-            prev = e.key;
+        var expect: u64 = switch (mode) {
+            .lt => 0,
+            .gt => n - 1,
+        };
+        while (it.next()) |e| : (switch (mode) {
+            .lt => expect += 1,
+            .gt => expect -|= 1,
+        }) {
+            try testing.expectEqual(expect * 7, e.key);
+            try testing.expectEqual(expect, e.value.*);
         }
-        try testing.expectEqual(tree.len(), seen);
+        try testing.expectEqual(switch (mode) {
+            .lt => n,
+            .gt => 0,
+        }, expect);
     }
 }
 
-test "stree: maxInt vs padding disambiguation" {
-    const Tree = STree(u64, u32);
-    var tree: Tree = try .init(testing.allocator, 200);
-    defer tree.deinit(testing.allocator);
+test "stree: reverse insert stays sorted" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u64);
+        var tree: Tree = try .init(testing.allocator, 1000);
+        defer tree.deinit(testing.allocator);
 
-    var i: u64 = 0;
-    while (i < 100) : (i += 1) _ = try tree.insert(i, @intCast(i));
+        var i: u64 = switch (mode) {
+            .lt => 500,
+            .gt => 0,
+        };
+        while (switch (mode) {
+            .lt => i > 0,
+            .gt => i < 500,
+        }) : (switch (mode) {
+            .lt => i -= 1,
+            .gt => i += 1,
+        }) {
+            _ = try tree.insert(i, i);
+        }
 
-    try testing.expectEqual(@as(?u32, null), tree.get(std.math.maxInt(u64)));
-    _ = try tree.insert(std.math.maxInt(u64), 777);
-    try testing.expectEqual(@as(?u32, 777), tree.get(std.math.maxInt(u64)));
-    try testing.expectEqual(@as(?u32, 777), tree.remove(std.math.maxInt(u64)));
-    try testing.expectEqual(@as(?u32, null), tree.get(std.math.maxInt(u64)));
+        var it = tree.iterator();
+        var prev: u64 = switch (mode) {
+            .lt => 0,
+            .gt => 500,
+        };
+        var seen: usize = 0;
+        while (it.next()) |e| : (seen += 1) {
+            try testing.expect(switch (mode) {
+                .lt => e.key > prev,
+                .gt => e.key < prev,
+            });
+            prev = e.key;
+        }
+        try testing.expectEqual(500, seen);
+    }
+}
+
+test "stree: remove drains to empty and reuses" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u64);
+        var tree: Tree = try .init(testing.allocator, 1000);
+        defer tree.deinit(testing.allocator);
+
+        const n = 800;
+        var i: u64 = 0;
+        while (i < n) : (i += 1) _ = try tree.insert(i, i * 2);
+
+        i = 0;
+        while (i < n) : (i += 2) {
+            try testing.expectEqual(i * 2, tree.remove(i));
+            try testing.expectEqual(null, tree.remove(i));
+        }
+        try testing.expectEqual(n / 2, tree.size);
+
+        var it = tree.iterator();
+        var expect: u64 = switch (mode) {
+            .lt => 1,
+            .gt => n - 1,
+        };
+        while (it.next()) |e| : (switch (mode) {
+            .lt => expect += 2,
+            .gt => expect -|= 2,
+        }) {
+            try testing.expectEqual(expect, e.key);
+        }
+
+        i = switch (mode) {
+            .lt => 1,
+            .gt => n - 1,
+        };
+        while (switch (mode) {
+            .lt => i < n,
+            .gt => i > 0,
+        }) : (switch (mode) {
+            .lt => i += 2,
+            .gt => i -|= 2,
+        }) _ = tree.remove(i);
+        try testing.expectEqual(0, tree.size);
+        try testing.expectEqual(null, tree.get(3));
+        var emptyIt = tree.iterator();
+        try testing.expectEqual(null, emptyIt.next());
+
+        _ = try tree.insert(7, 7);
+        try testing.expectEqual(7, tree.get(7));
+    }
+}
+
+test "stree: error.Full at pool exhaustion, tree stays valid" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u32);
+        var tree: Tree = try .init(testing.allocator, 1000);
+        defer tree.deinit(testing.allocator);
+
+        var i: u64 = 0;
+        var hitFull = false;
+        while (i < 100000) : (i += 1) {
+            _ = tree.insert(i, @intCast(i)) catch |e| {
+                try testing.expectEqual(error.Full, e);
+                hitFull = true;
+                break;
+            };
+        }
+        i -= 1;
+        try testing.expect(hitFull);
+
+        var it = tree.iterator();
+        var expect: u64 = switch (mode) {
+            .lt => 0,
+            .gt => i,
+        };
+        while (it.next()) |e| : (switch (mode) {
+            .lt => expect += 1,
+            // this will saturate but the iterator should end first
+            .gt => expect -|= 1,
+        }) {
+            try testing.expectEqual(expect, e.key);
+        }
+        try testing.expectEqual(switch (mode) {
+            .lt => tree.size,
+            .gt => 0,
+        }, expect);
+    }
+}
+
+test "stree: block iterator matches entry iterator" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u32);
+        var tree: Tree = try .init(testing.allocator, 3000);
+        defer tree.deinit(testing.allocator);
+
+        var prng = std.Random.DefaultPrng.init(0xB10C);
+        const random = prng.random();
+        var i: usize = 0;
+        while (i < 2500) : (i += 1) _ = try tree.insert(random.int(u48), @intCast(i));
+
+        i = 0;
+        var prng2 = std.Random.DefaultPrng.init(0xB10C);
+        const random2 = prng2.random();
+        while (i < 1000) : (i += 1) _ = tree.remove(random2.int(u48));
+
+        var entries = tree.iterator();
+        var blocks = tree.blockIterator();
+        var seen: usize = 0;
+        while (blocks.next()) |blk| {
+            for (blk.keys, blk.values) |k, v| {
+                const e = entries.next().?;
+                try testing.expectEqual(e.key, k);
+                try testing.expectEqual(e.value.*, v);
+                seen += 1;
+            }
+        }
+        try testing.expectEqual(null, entries.next());
+        try testing.expectEqual(tree.size, seen);
+    }
+}
+
+test "stree: void values (set mode)" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, void);
+        var set: Tree = try .init(testing.allocator, 2000);
+        defer set.deinit(testing.allocator);
+
+        var i: usize = 0;
+        while (i < 1500) : (i += 1) {
+            try testing.expectEqual(null, try set.insert(i * 3, {}));
+        }
+        try testing.expectEqual(1500, set.size);
+        try testing.expect(set.contains(300));
+        try testing.expect(!set.contains(301));
+        try testing.expect((try set.insert(300, {})) != null);
+
+        var it = set.iterator();
+        var expect: u64 = switch (mode) {
+            .lt => 0,
+            .gt => 1500 - 1,
+        };
+        while (it.next()) |e| : (switch (mode) {
+            .lt => expect += 1,
+            // this will saturate but it.next will fail the next iteration
+            .gt => expect -|= 1,
+        }) {
+            try testing.expectEqual(expect * 3, e.key);
+        }
+        try testing.expectEqual(switch (mode) {
+            .lt => 1500,
+            .gt => 0,
+        }, expect);
+
+        try testing.expect(set.remove(300) != null);
+        try testing.expect(!set.contains(300));
+
+        // Segment for values must be zero bytes for void
+        var tree: STree(mode, u64, u32) = try .init(testing.allocator, 2000);
+        defer tree.deinit(testing.allocator);
+        try testing.expect(tree.slab.len > set.slab.len);
+        try testing.expectEqual(
+            tree.slab.len - @as(usize, tree.blocks) * STree(mode, u64, u32).width * @sizeOf(u32),
+            set.slab.len,
+        );
+    }
+}
+
+test "stree: key widths derive W, natural widths work" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        inline for ([_]type{ u16, u32, u64, i32 }) |Key| {
+            const Tree = STree(mode, Key, u32);
+            try testing.expectEqual(
+                blockLineFactor * std.atomic.cache_line,
+                Tree.width * @sizeOf(Key),
+            );
+
+            var tree: Tree = try .init(testing.allocator, 3000);
+            defer tree.deinit(testing.allocator);
+
+            var prng = std.Random.DefaultPrng.init(@bitSizeOf(Key));
+            const random = prng.random();
+            var i: u64 = 0;
+            while (i < 2000) : (i += 1) {
+                _ = try tree.insert(random.int(Key), @truncate(i));
+            }
+
+            var it = tree.iterator();
+            var prev: ?Key = null;
+            var seen: usize = 0;
+            while (it.next()) |e| : (seen += 1) {
+                if (prev) |p| switch (mode) {
+                    .lt => try testing.expect(e.key > p),
+                    .gt => try testing.expect(e.key < p),
+                };
+                prev = e.key;
+            }
+            try testing.expectEqual(tree.size, seen);
+        }
+    }
+}
+
+test "stree: sentinel vs padding disambiguation" {
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u32);
+        var tree: Tree = try .init(testing.allocator, 200);
+        defer tree.deinit(testing.allocator);
+
+        const sentinel = switch (mode) {
+            .lt => std.math.maxInt(u64),
+            .gt => 0,
+        };
+
+        var i: u64 = switch (mode) {
+            .lt => 0,
+            .gt => 100,
+        };
+        while (switch (mode) {
+            .lt => i < 100,
+            .gt => i > 0,
+        }) : (switch (mode) {
+            .lt => i += 1,
+            .gt => i -= 1,
+        }) _ = try tree.insert(i, @intCast(i));
+
+        try testing.expectEqual(null, tree.get(sentinel));
+        _ = try tree.insert(sentinel, 777);
+        try testing.expectEqual(777, tree.get(sentinel));
+        try testing.expectEqual(777, tree.remove(sentinel));
+        try testing.expectEqual(null, tree.get(sentinel));
+    }
 }
 
 test "stree: maxInt and zero keys" {
-    const Tree = STree(u64, u8);
-    var tree: Tree = try .init(testing.allocator, 3);
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u8);
+        var tree: Tree = try .init(testing.allocator, 3);
+        defer tree.deinit(testing.allocator);
 
-    const max = std.math.maxInt(u64);
-    _ = try tree.insert(max, 1);
-    _ = try tree.insert(0, 2);
-    _ = try tree.insert(max - 1, 3);
+        const sentinel = switch (mode) {
+            .lt => std.math.maxInt(u64),
+            .gt => 0,
+        };
+        const invertSentinel = switch (mode) {
+            .lt => 0,
+            .gt => std.math.maxInt(u64),
+        };
+        const adjacentToSentinel = switch (mode) {
+            .lt => sentinel - 1,
+            .gt => sentinel + 1,
+        };
 
-    try testing.expectEqual(@as(?u8, 1), tree.get(max));
-    try testing.expectEqual(@as(?u8, 2), tree.get(0));
-    try testing.expectEqual(@as(?u8, 3), tree.get(max - 1));
+        _ = try tree.insert(sentinel, 1);
+        _ = try tree.insert(invertSentinel, 2);
+        _ = try tree.insert(adjacentToSentinel, 3);
 
-    try testing.expectEqual(@as(?u8, 1), tree.remove(max));
-    try testing.expectEqual(@as(?u8, null), tree.get(max));
-    try testing.expectEqual(@as(?u8, 3), tree.get(max - 1));
+        try testing.expectEqual(1, tree.get(sentinel));
+        try testing.expectEqual(2, tree.get(invertSentinel));
+        try testing.expectEqual(3, tree.get(adjacentToSentinel));
+
+        try testing.expectEqual(1, tree.remove(sentinel));
+        try testing.expectEqual(null, tree.get(sentinel));
+        try testing.expectEqual(3, tree.get(adjacentToSentinel));
+    }
 }
 
 test "stree: fuzz against hashmap reference" {
-    const Tree = STree(u64, u64);
-    var tree: Tree = try .init(testing.allocator, 4096);
-    defer tree.deinit(testing.allocator);
+    inline for (comptime std.meta.tags(ComparisonMode)) |mode| {
+        const Tree = STree(mode, u64, u64);
+        var tree: Tree = try .init(testing.allocator, 4096);
+        defer tree.deinit(testing.allocator);
 
-    var ref: std.AutoHashMapUnmanaged(u64, u64) = .empty;
-    defer ref.deinit(testing.allocator);
+        var ref: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer ref.deinit(testing.allocator);
 
-    var prng = std.Random.DefaultPrng.init(0x57EE);
-    const random = prng.random();
+        var prng = std.Random.DefaultPrng.init(0x57EE);
+        const random = prng.random();
 
-    var op: usize = 0;
-    while (op < 20000) : (op += 1) {
-        // Forcing churn for update/removes
-        const key = random.uintLessThan(u64, 4096);
-        if (random.boolean()) {
-            const val = random.int(u64);
-            const treeOld = try tree.insert(key, val);
-            const refOld = try ref.fetchPut(testing.allocator, key, val);
-            try testing.expectEqual(if (refOld) |kv| @as(?u64, kv.value) else null, treeOld);
-        } else {
-            const treeOld = tree.remove(key);
-            const refOld = ref.fetchRemove(key);
-            try testing.expectEqual(if (refOld) |kv| @as(?u64, kv.value) else null, treeOld);
+        var op: usize = 0;
+        while (op < 20000) : (op += 1) {
+            // Forcing churn for update/removes
+            const key = random.uintLessThan(u64, 4096);
+            if (random.boolean()) {
+                const val = random.int(u64);
+                const treeOld = try tree.insert(key, val);
+                const refOld = try ref.fetchPut(testing.allocator, key, val);
+                try testing.expectEqual(if (refOld) |kv| kv.value else null, treeOld);
+            } else {
+                const treeOld = tree.remove(key);
+                const refOld = ref.fetchRemove(key);
+                try testing.expectEqual(if (refOld) |kv| kv.value else null, treeOld);
+            }
+            try testing.expectEqual(ref.count(), tree.size);
         }
-        try testing.expectEqual(@as(usize, ref.count()), tree.len());
-    }
 
-    var it = tree.iterator();
-    var prev: ?u64 = null;
-    var seen: usize = 0;
-    while (it.next()) |e| : (seen += 1) {
-        if (prev) |p| try testing.expect(e.key > p);
-        prev = e.key;
-        try testing.expectEqual(@as(?u64, ref.get(e.key)), e.value.*);
+        var it = tree.iterator();
+        var prev: ?u64 = null;
+        var seen: usize = 0;
+        while (it.next()) |e| : (seen += 1) {
+            if (prev) |p| switch (mode) {
+                .lt => try testing.expect(e.key > p),
+                .gt => try testing.expect(e.key < p),
+            };
+            prev = e.key;
+            try testing.expectEqual(ref.get(e.key), e.value.*);
+        }
+        try testing.expectEqual(ref.count(), seen);
     }
-    try testing.expectEqual(@as(usize, ref.count()), seen);
 }
