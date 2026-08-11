@@ -101,6 +101,16 @@ pub fn stackFallback(buffer: []u8, fallback_allocator: Allocator) PromotingSfba 
     };
 }
 
+pub fn freeAligned(allocator: std.mem.Allocator, alignment: Alignment, memory: anytype) void {
+    const slice_info = @typeInfo(@TypeOf(memory)).pointer;
+    comptime assert(slice_info.size == .slice);
+    const bytes: []u8 = @ptrCast(@constCast(std.mem.absorbSentinel(memory)));
+    if (bytes.len == 0) return;
+    @memset(bytes, undefined);
+
+    allocator.rawFree(memory, alignment, @returnAddress());
+}
+
 test "StackFallbackAllocator" {
     {
         var buffer: [4096]u8 = undefined;

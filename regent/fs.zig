@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ergo = @import("ergo.zig");
+const mem = @import("mem.zig");
 const units = @import("units.zig");
 const rlinux = @import("linux.zig");
 const Context = ergo.Context;
@@ -661,27 +662,50 @@ pub fn FileStream(mode: Mode) type {
             unreachable;
         }
 
-        pub fn close(self: @This(), context: Context) void {
+        pub fn readOnceAll(self: *@This()) ![]const u8 {
+            return _fs.readOnceAll(&self.stream.interface);
+        }
+
+        pub fn close(self: *@This(), context: Context) void {
             self.stream.file.close(context.io);
         }
 
         pub fn deinit(self: *@This(), context: Context) void {
             switch (self.bufferType) {
                 .full, .byte, .unmanaged => {
-                    const memory = self.stream.interface.buffer;
-                    const slice_info = @typeInfo(@TypeOf(memory)).pointer;
-                    comptime assert(slice_info.size == .slice);
-                    const bytes: []u8 = @ptrCast(@constCast(std.mem.absorbSentinel(memory)));
-                    if (bytes.len == 0) return;
-                    @memset(bytes, undefined);
-
-                    context.allocator.rawFree(memory, self.alignment, @returnAddress());
+                    mem.freeAligned(context.allocator, self.alignment, self.stream.interface.buffer);
                     self.stream.interface.buffer = undefined;
                 },
                 .mmap => std.posix.munmap(@alignCast(self.stream.interface.buffer)),
             }
         }
     };
+}
+
+const _fs = @This();
+
+// This method is job is not to actually do it this way, but to ensure it was done in this specific way
+// the caller is responsible to make the invariants hold for this to work, as a matter of fact this will
+// silently return in non-debug
+pub fn readOnceAll(r: *std.Io.Reader) ![]const u8 {
+    r.fillMore() catch |e| switch (e) {
+        error.EndOfStream => return r.buffered(),
+        error.ReadFailed => return e,
+    };
+
+    // force an extra syscall to fail and ensure we read everything in the first go on debug mode
+    if (ergo.isDebug and r.bufferedLen() < r.buffer.len) {
+        const len = r.bufferedLen();
+        if (r.fill(r.buffer.len))
+            std.debug.assert(false)
+        else |e| switch (e) {
+            error.EndOfStream => std.debug.assert(len == r.bufferedLen()),
+            // possible on pid delete
+            error.ReadFailed => {},
+        }
+    }
+
+    return r.buffered();
 }
 
 pub const FileCursorError = error{
